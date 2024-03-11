@@ -1149,7 +1149,7 @@ static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
 					       kvm_granule_size(ctx->level));
 
 	if (childp)
-		mm_ops->put_page(childp);
+		mm_ops->free_unlinked_table(childp, ctx->level);
 
 	return 0;
 }
