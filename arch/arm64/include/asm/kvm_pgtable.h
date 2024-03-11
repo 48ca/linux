@@ -644,6 +644,7 @@ kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable __rcu *pgt, u64 addr);
  * @addr:	Intermediate physical address to identify the page-table entry.
  * @size:	Size of the address range to visit.
  * @mkold:	True if the access flag should be cleared.
+ * @range:	The kvm_gfn_range that is being used for the memslot walker.
  *
  * The offset of @addr within a page is ignored.
  *
@@ -656,8 +657,9 @@ kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable __rcu *pgt, u64 addr);
  *
  * Return: True if any of the visited PTEs had the access flag set.
  */
-bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable __rcu *pgt,
-					 u64 addr, u64 size, bool mkold);
+bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+					 u64 size, bool mkold,
+					 struct kvm_gfn_range *range);
 
 /**
  * kvm_pgtable_stage2_relax_perms() - Relax the permissions enforced by a
