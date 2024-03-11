@@ -915,9 +915,14 @@ static int kvm_mmu_notifier_clear_flush_young(struct mmu_notifier *mn,
 static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
 					struct mm_struct *mm,
 					unsigned long start,
-					unsigned long end)
+					unsigned long end,
+					unsigned long *bitmap)
 {
 	trace_kvm_age_hva(start, end);
+
+	/* We don't support bitmaps. Don't test or clear anything. */
+	if (bitmap)
+		return MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE;
 
 	/*
 	 * Even though we do not flush TLB, this will still adversely
@@ -937,11 +942,17 @@ static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
 
 static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
 				       struct mm_struct *mm,
-				       unsigned long address)
+				       unsigned long start,
+				       unsigned long end,
+				       unsigned long *bitmap)
 {
-	trace_kvm_test_age_hva(address);
+	trace_kvm_test_age_hva(start, end);
 
-	return kvm_handle_hva_range_no_flush(mn, address, address + 1,
+	/* We don't support bitmaps. Don't test or clear anything. */
+	if (bitmap)
+		return MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE;
+
+	return kvm_handle_hva_range_no_flush(mn, start, end,
 					     kvm_test_age_gfn);
 }
 

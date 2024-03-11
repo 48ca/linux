@@ -384,7 +384,8 @@ int __mmu_notifier_clear_flush_young(struct mm_struct *mm,
 
 int __mmu_notifier_clear_young(struct mm_struct *mm,
 			       unsigned long start,
-			       unsigned long end)
+			       unsigned long end,
+			       unsigned long *bitmap)
 {
 	struct mmu_notifier *subscription;
 	int young = 0, id;
@@ -395,7 +396,8 @@ int __mmu_notifier_clear_young(struct mm_struct *mm,
 				 srcu_read_lock_held(&srcu)) {
 		if (subscription->ops->clear_young)
 			young |= subscription->ops->clear_young(subscription,
-								mm, start, end);
+								mm, start, end,
+								bitmap);
 	}
 	srcu_read_unlock(&srcu, id);
 
@@ -403,7 +405,8 @@ int __mmu_notifier_clear_young(struct mm_struct *mm,
 }
 
 int __mmu_notifier_test_young(struct mm_struct *mm,
-			      unsigned long address)
+			      unsigned long start, unsigned long end,
+			      unsigned long *bitmap)
 {
 	struct mmu_notifier *subscription;
 	int young = 0, id;
@@ -413,9 +416,14 @@ int __mmu_notifier_test_young(struct mm_struct *mm,
 				 &mm->notifier_subscriptions->list, hlist,
 				 srcu_read_lock_held(&srcu)) {
 		if (subscription->ops->test_young) {
-			young = subscription->ops->test_young(subscription, mm,
-							      address);
-			if (young)
+			young |= subscription->ops->test_young(subscription, mm,
+							       start, end,
+							       bitmap);
+			if (young && !bitmap)
+				/*
+				 * We're not using a bitmap, so there is no
+				 * need to check any more secondary MMUs.
+				 */
 				break;
 		}
 	}

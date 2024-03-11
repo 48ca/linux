@@ -61,6 +61,10 @@ enum mmu_notifier_event {
 
 #define MMU_NOTIFIER_RANGE_BLOCKABLE (1 << 0)
 
+#define MMU_NOTIFIER_YOUNG			(1 << 0)
+#define MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE	(1 << 1)
+#define MMU_NOTIFIER_YOUNG_FAST			(1 << 2)
+
 struct mmu_notifier_ops {
 	/*
 	 * Called either by mmu_notifier_unregister or when the mm is
@@ -106,21 +110,34 @@ struct mmu_notifier_ops {
 	 * clear_young is a lightweight version of clear_flush_young. Like the
 	 * latter, it is supposed to test-and-clear the young/accessed bitflag
 	 * in the secondary pte, but it may omit flushing the secondary tlb.
+	 *
+	 * If @bitmap is given but is not supported, return
+	 * MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE.
+	 *
+	 * If the walk is done "quickly", return MMU_NOTIFIER_YOUNG_FAST.
 	 */
 	int (*clear_young)(struct mmu_notifier *subscription,
 			   struct mm_struct *mm,
 			   unsigned long start,
-			   unsigned long end);
+			   unsigned long end,
+			   unsigned long *bitmap);
 
 	/*
 	 * test_young is called to check the young/accessed bitflag in
 	 * the secondary pte. This is used to know if the page is
 	 * frequently used without actually clearing the flag or tearing
 	 * down the secondary mapping on the page.
+	 *
+	 * If @bitmap is given but is not supported, return
+	 * MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE.
+	 *
+	 * If the walk is done "quickly", return MMU_NOTIFIER_YOUNG_FAST.
 	 */
 	int (*test_young)(struct mmu_notifier *subscription,
 			  struct mm_struct *mm,
-			  unsigned long address);
+			  unsigned long start,
+			  unsigned long end,
+			  unsigned long *bitmap);
 
 	/*
 	 * change_pte is called in cases that pte mapping to page is changed:
@@ -388,10 +405,11 @@ extern int __mmu_notifier_clear_flush_young(struct mm_struct *mm,
 					  unsigned long start,
 					  unsigned long end);
 extern int __mmu_notifier_clear_young(struct mm_struct *mm,
-				      unsigned long start,
-				      unsigned long end);
+				      unsigned long start, unsigned long end,
+				      unsigned long *bitmap);
 extern int __mmu_notifier_test_young(struct mm_struct *mm,
-				     unsigned long address);
+				     unsigned long start, unsigned long end,
+				     unsigned long *bitmap);
 extern void __mmu_notifier_change_pte(struct mm_struct *mm,
 				      unsigned long address, pte_t pte);
 extern int __mmu_notifier_invalidate_range_start(struct mmu_notifier_range *r);
@@ -427,7 +445,25 @@ static inline int mmu_notifier_clear_young(struct mm_struct *mm,
 					   unsigned long end)
 {
 	if (mm_has_notifiers(mm))
-		return __mmu_notifier_clear_young(mm, start, end);
+		return __mmu_notifier_clear_young(mm, start, end, NULL);
+	return 0;
+}
+
+/*
+ * When @bitmap is not provided, clear the young bits in the secondary
+ * MMUs for all of the pages in the interval [start, end).
+ *
+ * If any subscribed secondary MMU does not support @bitmap, this function
+ * will return an integer containing MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE.
+ * Some work may have been done in the secondary MMU.
+ */
+static inline int mmu_notifier_clear_young_bitmap(struct mm_struct *mm,
+						  unsigned long start,
+						  unsigned long end,
+						  unsigned long *bitmap)
+{
+	if (mm_has_notifiers(mm))
+		return __mmu_notifier_clear_young(mm, start, end, bitmap);
 	return 0;
 }
 
@@ -435,7 +471,25 @@ static inline int mmu_notifier_test_young(struct mm_struct *mm,
 					  unsigned long address)
 {
 	if (mm_has_notifiers(mm))
-		return __mmu_notifier_test_young(mm, address);
+		return __mmu_notifier_test_young(mm, address, address + 1,
+						 NULL);
+	return 0;
+}
+
+/*
+ * When @bitmap is not provided, test the young bits in the secondary
+ * MMUs for all of the pages in the interval [start, end).
+ *
+ * If any subscribed secondary MMU does not support @bitmap, this function
+ * will return an integer containing MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE.
+ */
+static inline int mmu_notifier_test_young_bitmap(struct mm_struct *mm,
+						 unsigned long start,
+						 unsigned long end,
+						 unsigned long *bitmap)
+{
+	if (mm_has_notifiers(mm))
+		return __mmu_notifier_test_young(mm, start, end, bitmap);
 	return 0;
 }
 
@@ -644,8 +698,31 @@ static inline int mmu_notifier_clear_flush_young(struct mm_struct *mm,
 	return 0;
 }
 
+static inline int mmu_notifier_clear_young(struct mm_struct *mm,
+					   unsigned long start,
+					   unsigned long end)
+{
+	return 0;
+}
+
+static inline int mmu_notifier_clear_young_bitmap(struct mm_struct *mm,
+						  unsigned long start,
+						  unsigned long end,
+						  unsigned long *bitmap)
+{
+	return 0;
+}
+
 static inline int mmu_notifier_test_young(struct mm_struct *mm,
 					  unsigned long address)
+{
+	return 0;
+}
+
+static inline int mmu_notifier_test_young_bitmap(struct mm_struct *mm,
+						 unsigned long start,
+						 unsigned long end,
+						 unsigned long *bitmap)
 {
 	return 0;
 }

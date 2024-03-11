@@ -490,18 +490,21 @@ TRACE_EVENT(kvm_age_hva,
 );
 
 TRACE_EVENT(kvm_test_age_hva,
-	TP_PROTO(unsigned long hva),
-	TP_ARGS(hva),
+	TP_PROTO(unsigned long start, unsigned long end),
+	TP_ARGS(start, end),
 
 	TP_STRUCT__entry(
-		__field(	unsigned long,	hva		)
+		__field(	unsigned long,	start		)
+		__field(	unsigned long,	end		)
 	),
 
 	TP_fast_assign(
-		__entry->hva		= hva;
+		__entry->start		= start;
+		__entry->end		= end;
 	),
 
-	TP_printk("mmu notifier test age hva: %#016lx", __entry->hva)
+	TP_printk("mmu notifier test age hva: %#016lx -- %#016lx",
+		  __entry->start, __entry->end)
 );
 
 #endif /* _TRACE_KVM_MAIN_H */
