@@ -477,7 +477,8 @@ size_t kvm_pgtable_stage2_pgd_size(u64 vtcr);
  *
  * Return: 0 on success, negative error code on failure.
  */
-int __kvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
+int __kvm_pgtable_stage2_init(struct kvm_pgtable __rcu *pgt,
+			      struct kvm_s2_mmu *mmu,
 			      struct kvm_pgtable_mm_ops *mm_ops,
 			      enum kvm_pgtable_stage2_flags flags,
 			      kvm_pgtable_force_pte_cb_t force_pte_cb);
@@ -492,7 +493,7 @@ int __kvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
  * The page-table is assumed to be unreachable by any hardware walkers prior
  * to freeing and therefore no TLB invalidation is performed.
  */
-void kvm_pgtable_stage2_destroy(struct kvm_pgtable *pgt);
+void kvm_pgtable_stage2_destroy(struct kvm_pgtable __rcu *pgt);
 
 /**
  * kvm_pgtable_stage2_free_unlinked() - Free an unlinked stage-2 paging structure.
@@ -526,7 +527,7 @@ void kvm_pgtable_stage2_free_unlinked(struct kvm_pgtable_mm_ops *mm_ops, void *p
  * Return: The fully populated (unlinked) stage-2 paging structure, or
  * an ERR_PTR(error) on failure.
  */
-kvm_pte_t *kvm_pgtable_stage2_create_unlinked(struct kvm_pgtable *pgt,
+kvm_pte_t *kvm_pgtable_stage2_create_unlinked(struct kvm_pgtable __rcu *pgt,
 					      u64 phys, s8 level,
 					      enum kvm_pgtable_prot prot,
 					      void *mc, bool force_pte);
@@ -560,7 +561,7 @@ kvm_pte_t *kvm_pgtable_stage2_create_unlinked(struct kvm_pgtable *pgt,
  *
  * Return: 0 on success, negative error code on failure.
  */
-int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
+int kvm_pgtable_stage2_map(struct kvm_pgtable __rcu *pgt, u64 addr, u64 size,
 			   u64 phys, enum kvm_pgtable_prot prot,
 			   void *mc, enum kvm_pgtable_walk_flags flags);
 
@@ -581,8 +582,8 @@ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
  *
  * Return: 0 on success, negative error code on failure.
  */
-int kvm_pgtable_stage2_set_owner(struct kvm_pgtable *pgt, u64 addr, u64 size,
-				 void *mc, u8 owner_id);
+int kvm_pgtable_stage2_set_owner(struct kvm_pgtable __rcu *pgt, u64 addr,
+				 u64 size, void *mc, u8 owner_id);
 
 /**
  * kvm_pgtable_stage2_unmap() - Remove a mapping from a guest stage-2 page-table.
@@ -601,7 +602,7 @@ int kvm_pgtable_stage2_set_owner(struct kvm_pgtable *pgt, u64 addr, u64 size,
  *
  * Return: 0 on success, negative error code on failure.
  */
-int kvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size);
+int kvm_pgtable_stage2_unmap(struct kvm_pgtable __rcu *pgt, u64 addr, u64 size);
 
 /**
  * kvm_pgtable_stage2_wrprotect() - Write-protect guest stage-2 address range
@@ -619,7 +620,8 @@ int kvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size);
  *
  * Return: 0 on success, negative error code on failure.
  */
-int kvm_pgtable_stage2_wrprotect(struct kvm_pgtable *pgt, u64 addr, u64 size);
+int kvm_pgtable_stage2_wrprotect(struct kvm_pgtable __rcu *pgt, u64 addr,
+				 u64 size);
 
 /**
  * kvm_pgtable_stage2_mkyoung() - Set the access flag in a page-table entry.
@@ -633,7 +635,7 @@ int kvm_pgtable_stage2_wrprotect(struct kvm_pgtable *pgt, u64 addr, u64 size);
  *
  * Return: The old page-table entry prior to setting the flag, 0 on failure.
  */
-kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr);
+kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable __rcu *pgt, u64 addr);
 
 /**
  * kvm_pgtable_stage2_test_clear_young() - Test and optionally clear the access
@@ -654,8 +656,8 @@ kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr);
  *
  * Return: True if any of the visited PTEs had the access flag set.
  */
-bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
-					 u64 size, bool mkold);
+bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable __rcu *pgt,
+					 u64 addr, u64 size, bool mkold);
 
 /**
  * kvm_pgtable_stage2_relax_perms() - Relax the permissions enforced by a
@@ -674,7 +676,7 @@ bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
  *
  * Return: 0 on success, negative error code on failure.
  */
-int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
+int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable __rcu *pgt, u64 addr,
 				   enum kvm_pgtable_prot prot);
 
 /**
@@ -690,7 +692,7 @@ int kvm_pgtable_stage2_relax_perms(struct kvm_pgtable *pgt, u64 addr,
  *
  * Return: 0 on success, negative error code on failure.
  */
-int kvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size);
+int kvm_pgtable_stage2_flush(struct kvm_pgtable __rcu *pgt, u64 addr, u64 size);
 
 /**
  * kvm_pgtable_stage2_split() - Split a range of huge pages into leaf PTEs pointing
@@ -708,7 +710,7 @@ int kvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size);
  * kvm_pgtable_stage2_split() is best effort: it tries to break as many
  * blocks in the input range as allowed by @mc_capacity.
  */
-int kvm_pgtable_stage2_split(struct kvm_pgtable *pgt, u64 addr, u64 size,
+int kvm_pgtable_stage2_split(struct kvm_pgtable __rcu *pgt, u64 addr, u64 size,
 			     struct kvm_mmu_memory_cache *mc);
 
 /**

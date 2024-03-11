@@ -55,7 +55,7 @@ static phys_addr_t stage2_range_addr_end(phys_addr_t addr, phys_addr_t end)
  */
 static int stage2_apply_range(struct kvm_s2_mmu *mmu, phys_addr_t addr,
 			      phys_addr_t end,
-			      int (*fn)(struct kvm_pgtable *, u64, u64),
+			      int (*fn)(struct kvm_pgtable __rcu *, u64, u64),
 			      bool resched)
 {
 	struct kvm *kvm = kvm_s2_mmu_to_kvm(mmu);
@@ -63,7 +63,7 @@ static int stage2_apply_range(struct kvm_s2_mmu *mmu, phys_addr_t addr,
 	u64 next;
 
 	do {
-		struct kvm_pgtable *pgt = mmu->pgt;
+		struct kvm_pgtable __rcu *pgt = mmu->pgt;
 		if (!pgt)
 			return -EINVAL;
 
@@ -115,7 +115,7 @@ static int kvm_mmu_split_huge_pages(struct kvm *kvm, phys_addr_t addr,
 				    phys_addr_t end)
 {
 	struct kvm_mmu_memory_cache *cache;
-	struct kvm_pgtable *pgt;
+	struct kvm_pgtable __rcu *pgt;
 	int ret, cache_capacity;
 	u64 next, chunk_size;
 
@@ -1011,7 +1011,7 @@ void stage2_unmap_vm(struct kvm *kvm)
 void kvm_free_stage2_pgd(struct kvm_s2_mmu *mmu)
 {
 	struct kvm *kvm = kvm_s2_mmu_to_kvm(mmu);
-	struct kvm_pgtable *pgt = NULL;
+	struct kvm_pgtable __rcu *pgt = NULL;
 
 	write_lock(&kvm->mmu_lock);
 	pgt = mmu->pgt;
@@ -1023,6 +1023,7 @@ void kvm_free_stage2_pgd(struct kvm_s2_mmu *mmu)
 	write_unlock(&kvm->mmu_lock);
 
 	if (pgt) {
+		synchronize_rcu();
 		kvm_pgtable_stage2_destroy(pgt);
 		kfree(pgt);
 	}

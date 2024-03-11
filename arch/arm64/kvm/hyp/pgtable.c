@@ -109,10 +109,10 @@ static u32 kvm_pgtable_idx(struct kvm_pgtable_walk_data *data, s8 level)
 	return (data->addr >> shift) & mask;
 }
 
-static u32 kvm_pgd_page_idx(struct kvm_pgtable *pgt, u64 addr)
+static u32 kvm_pgd_page_idx(struct kvm_pgtable __rcu *pgt, u64 addr)
 {
 	u64 shift = kvm_granule_shift(pgt->start_level - 1); /* May underflow */
-	u64 mask = BIT(pgt->ia_bits) - 1;
+	u64 mask = BIT(rcu_dereference(pgt)->ia_bits) - 1;
 
 	return (addr & mask) >> shift;
 }
@@ -298,7 +298,7 @@ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
 	return ret;
 }
 
-static int _kvm_pgtable_walk(struct kvm_pgtable *pgt, struct kvm_pgtable_walk_data *data)
+static int _kvm_pgtable_walk(struct kvm_pgtable __rcu *pgt, struct kvm_pgtable_walk_data *data)
 {
 	u32 idx;
 	int ret = 0;
@@ -307,13 +307,14 @@ static int _kvm_pgtable_walk(struct kvm_pgtable *pgt, struct kvm_pgtable_walk_da
 	if (data->addr > limit || data->end > limit)
 		return -ERANGE;
 
-	if (!pgt->pgd)
+	if (!rcu_dereference(pgt)->pgd)
 		return -EINVAL;
 
 	for (idx = kvm_pgd_page_idx(pgt, data->addr); data->addr < data->end; ++idx) {
-		kvm_pteref_t pteref = &pgt->pgd[idx * PTRS_PER_PTE];
+		kvm_pteref_t pteref = &rcu_dereference(pgt)->pgd[idx * PTRS_PER_PTE];
 
-		ret = __kvm_pgtable_walk(data, pgt->mm_ops, pteref, pgt->start_level);
+		ret = __kvm_pgtable_walk(data, rcu_dereference(pgt)->mm_ops,
+				pteref, rcu_dereference(pgt)->start_level);
 		if (ret)
 			break;
 	}
@@ -1149,7 +1150,7 @@ static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
 					       kvm_granule_size(ctx->level));
 
 	if (childp)
-		mm_ops->put_page(childp);
+		mm_ops->free_unlinked_table(childp, ctx->level);
 
 	return 0;
 }
@@ -1309,7 +1310,8 @@ bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
 	struct kvm_pgtable_walker walker = {
 		.cb		= stage2_age_walker,
 		.arg		= &data,
-		.flags		= KVM_PGTABLE_WALK_LEAF,
+		.flags		= KVM_PGTABLE_WALK_LEAF |
+				  KVM_PGTABLE_WALK_SHARED,
 	};
 
 	WARN_ON(kvm_pgtable_walk(pgt, addr, size, &walker));

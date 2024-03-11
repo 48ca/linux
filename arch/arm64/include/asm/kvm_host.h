@@ -157,7 +157,7 @@ struct kvm_s2_mmu {
 	 * canonical stage-2 page tables.
 	 */
 	phys_addr_t	pgd_phys;
-	struct kvm_pgtable *pgt;
+	struct kvm_pgtable __rcu *pgt;
 
 	/*
 	 * VTCR value used on the host. For a non-NV guest (or a NV
