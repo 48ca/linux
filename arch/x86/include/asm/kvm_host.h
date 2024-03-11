@@ -2307,4 +2307,10 @@ int memslot_rmap_alloc(struct kvm_memory_slot *slot, unsigned long npages);
  */
 #define KVM_EXIT_HYPERCALL_MBZ		GENMASK_ULL(31, 1)
 
+#define kvm_arch_supports_bitmap_age kvm_arch_supports_bitmap_age
+static inline bool kvm_arch_supports_bitmap_age(void)
+{
+	return IS_ENABLED(CONFIG_X86_64) && tdp_mmu_enabled && shadow_accessed_mask;
+}
+
 #endif /* _ASM_X86_KVM_HOST_H */
