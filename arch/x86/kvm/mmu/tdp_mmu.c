@@ -1167,6 +1167,9 @@ static bool age_gfn_range(struct kvm *kvm, struct tdp_iter *iter,
 	if (!is_accessed_spte(iter->old_spte))
 		return false;
 
+	if (!kvm_gfn_should_age(range, iter->gfn))
+		return false;
+
 	if (spte_ad_enabled(iter->old_spte)) {
 		iter->old_spte = tdp_mmu_clear_spte_bits(iter->sptep,
 							 iter->old_spte,
@@ -1200,7 +1203,12 @@ bool kvm_tdp_mmu_age_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
 static bool test_age_gfn(struct kvm *kvm, struct tdp_iter *iter,
 			 struct kvm_gfn_range *range)
 {
-	return is_accessed_spte(iter->old_spte);
+	bool young = is_accessed_spte(iter->old_spte);
+
+	if (young)
+		kvm_gfn_record_young(range, iter->gfn);
+
+	return young;
 }
 
 bool kvm_tdp_mmu_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
