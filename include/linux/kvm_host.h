@@ -1960,6 +1960,20 @@ extern const struct _kvm_stats_desc kvm_vm_stats_desc[];
 extern const struct kvm_stats_header kvm_vcpu_stats_header;
 extern const struct _kvm_stats_desc kvm_vcpu_stats_desc[];
 
+/*
+ * Architectures that support using bitmaps for kvm_age_gfn and kvm_test_age_gfn
+ * should return true for kvm_arch_supports_bitmap_age().
+ *
+ * kvm_arch_supports_bitmap_age() is allowed to return true even if, at
+ * runtime, bitmap-based aging isn't possible.
+ */
+#ifndef kvm_arch_supports_bitmap_age
+static inline bool kvm_arch_supports_bitmap_age(void)
+{
+	return false;
+}
+#endif
+
 #ifdef CONFIG_KVM_GENERIC_MMU_NOTIFIER
 static inline int mmu_invalidate_retry(struct kvm *kvm, unsigned long mmu_seq)
 {
@@ -2013,9 +2027,16 @@ static inline int mmu_invalidate_retry_gfn(struct kvm *kvm,
 	return 0;
 }
 
+struct test_clear_young_metadata {
+	unsigned long *bitmap;
+	unsigned long bitmap_offset_end;
+	unsigned long end;
+	bool unreliable;
+};
 union kvm_mmu_notifier_arg {
 	pte_t pte;
 	unsigned long attributes;
+	struct test_clear_young_metadata *metadata;
 };
 
 struct kvm_gfn_range {
@@ -2024,11 +2045,43 @@ struct kvm_gfn_range {
 	gfn_t end;
 	union kvm_mmu_notifier_arg arg;
 	bool may_block;
+	bool lockless;
 };
 bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range);
 bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
 bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
 bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range);
+static inline void kvm_age_set_unreliable(struct kvm_gfn_range *range)
+{
+	struct test_clear_young_metadata *args = range->arg.metadata;
+
+	args->unreliable = true;
+}
+static inline unsigned long kvm_young_bitmap_offset(struct kvm_gfn_range *range,
+						    gfn_t gfn)
+{
+	struct test_clear_young_metadata *args = range->arg.metadata;
+
+	return hva_to_gfn_memslot(args->end - 1, range->slot) - gfn;
+}
+static inline void kvm_gfn_record_young(struct kvm_gfn_range *range, gfn_t gfn)
+{
+	struct test_clear_young_metadata *args = range->arg.metadata;
+
+	WARN_ON_ONCE(gfn < range->start || gfn >= range->end);
+	if (args->bitmap)
+		__set_bit(kvm_young_bitmap_offset(range, gfn), args->bitmap);
+}
+static inline bool kvm_gfn_should_age(struct kvm_gfn_range *range, gfn_t gfn)
+{
+	struct test_clear_young_metadata *args = range->arg.metadata;
+
+	WARN_ON_ONCE(gfn < range->start || gfn >= range->end);
+	if (args->bitmap)
+		return test_bit(kvm_young_bitmap_offset(range, gfn),
+				args->bitmap);
+	return true;
+}
 #endif
 
 #ifdef CONFIG_HAVE_KVM_IRQ_ROUTING
