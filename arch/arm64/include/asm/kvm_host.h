@@ -1233,4 +1233,10 @@ static inline void kvm_hyp_reserve(void) { }
 void kvm_arm_vcpu_power_off(struct kvm_vcpu *vcpu);
 bool kvm_arm_vcpu_stopped(struct kvm_vcpu *vcpu);
 
+#define kvm_arch_has_fast_test_age_gfn kvm_arch_has_fast_test_age_gfn
+static inline bool kvm_arch_has_fast_test_age_gfn(void)
+{
+	return true;
+}
+
 #endif /* __ARM64_KVM_HOST_H__ */

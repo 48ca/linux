@@ -1267,6 +1267,7 @@ kvm_pte_t kvm_pgtable_stage2_mkyoung(struct kvm_pgtable *pgt, u64 addr)
 }
 
 struct stage2_age_data {
+	struct kvm_gfn_range *range;
 	bool	mkold;
 	bool	young;
 };
@@ -1276,20 +1277,24 @@ static int stage2_age_walker(const struct kvm_pgtable_visit_ctx *ctx,
 {
 	kvm_pte_t new = ctx->old & ~KVM_PTE_LEAF_ATTR_LO_S2_AF;
 	struct stage2_age_data *data = ctx->arg;
+	gfn_t gfn = ctx->addr / PAGE_SIZE;
 
 	if (!kvm_pte_valid(ctx->old) || new == ctx->old)
 		return 0;
 
 	data->young = true;
 
+
 	/*
-	 * stage2_age_walker() is always called while holding the MMU lock for
-	 * write, so this will always succeed. Nonetheless, this deliberately
-	 * follows the race detection pattern of the other stage-2 walkers in
-	 * case the locking mechanics of the MMU notifiers is ever changed.
+	 * stage2_age_walker() may not be holding the MMU lock for write, so
+	 * follow the race detection pattern of the other stage-2 walkers.
 	 */
-	if (data->mkold && !stage2_try_set_pte(ctx, new))
-		return -EAGAIN;
+	if (data->mkold) {
+		if (kvm_gfn_should_age(data->range, gfn) &&
+				!stage2_try_set_pte(ctx, new))
+			return -EAGAIN;
+	} else
+		kvm_gfn_record_young(data->range, gfn);
 
 	/*
 	 * "But where's the TLBI?!", you scream.
@@ -1301,10 +1306,12 @@ static int stage2_age_walker(const struct kvm_pgtable_visit_ctx *ctx,
 }
 
 bool kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
-					 u64 size, bool mkold)
+					 u64 size, bool mkold,
+					 struct kvm_gfn_range *range)
 {
 	struct stage2_age_data data = {
 		.mkold		= mkold,
+		.range		= range,
 	};
 	struct kvm_pgtable_walker walker = {
 		.cb		= stage2_age_walker,
