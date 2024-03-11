@@ -555,6 +555,7 @@ struct kvm_mmu_notifier_range {
 	on_lock_fn_t on_lock;
 	bool flush_on_ret;
 	bool may_block;
+	bool lockless;
 };
 
 /*
@@ -603,6 +604,8 @@ static __always_inline kvm_mn_ret_t __kvm_handle_hva_range(struct kvm *kvm,
 	struct kvm_memslots *slots;
 	int i, idx;
 
+	BUILD_BUG_ON(sizeof(gfn_range.arg) != sizeof(gfn_range.arg.pte));
+
 	if (WARN_ON_ONCE(range->end <= range->start))
 		return r;
 
@@ -642,15 +645,18 @@ static __always_inline kvm_mn_ret_t __kvm_handle_hva_range(struct kvm *kvm,
 			gfn_range.start = hva_to_gfn_memslot(hva_start, slot);
 			gfn_range.end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, slot);
 			gfn_range.slot = slot;
+			gfn_range.lockless = range->lockless;
 
 			if (!r.found_memslot) {
 				r.found_memslot = true;
-				KVM_MMU_LOCK(kvm);
-				if (!IS_KVM_NULL_FN(range->on_lock))
-					range->on_lock(kvm);
+				if (!range->lockless) {
+					KVM_MMU_LOCK(kvm);
+					if (!IS_KVM_NULL_FN(range->on_lock))
+						range->on_lock(kvm);
 
-				if (IS_KVM_NULL_FN(range->handler))
-					break;
+					if (IS_KVM_NULL_FN(range->handler))
+						break;
+				}
 			}
 			r.ret |= range->handler(kvm, &gfn_range);
 		}
@@ -659,7 +665,7 @@ static __always_inline kvm_mn_ret_t __kvm_handle_hva_range(struct kvm *kvm,
 	if (range->flush_on_ret && r.ret)
 		kvm_flush_remote_tlbs(kvm);
 
-	if (r.found_memslot)
+	if (r.found_memslot && !range->lockless)
 		KVM_MMU_UNLOCK(kvm);
 
 	srcu_read_unlock(&kvm->srcu, idx);
@@ -687,19 +693,24 @@ static __always_inline int kvm_handle_hva_range(struct mmu_notifier *mn,
 	return __kvm_handle_hva_range(kvm, &range).ret;
 }
 
-static __always_inline int kvm_handle_hva_range_no_flush(struct mmu_notifier *mn,
-							 unsigned long start,
-							 unsigned long end,
-							 gfn_handler_t handler)
+static __always_inline int kvm_handle_hva_range_no_flush(
+		struct mmu_notifier *mn,
+		unsigned long start,
+		unsigned long end,
+		gfn_handler_t handler,
+		union kvm_mmu_notifier_arg arg,
+		bool lockless)
 {
 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
 	const struct kvm_mmu_notifier_range range = {
 		.start		= start,
 		.end		= end,
 		.handler	= handler,
+		.arg		= arg,
 		.on_lock	= (void *)kvm_null_fn,
 		.flush_on_ret	= false,
 		.may_block	= false,
+		.lockless	= lockless,
 	};
 
 	return __kvm_handle_hva_range(kvm, &range).ret;
@@ -912,15 +923,33 @@ static int kvm_mmu_notifier_clear_flush_young(struct mmu_notifier *mn,
 				    kvm_age_gfn);
 }
 
-static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
-					struct mm_struct *mm,
-					unsigned long start,
-					unsigned long end,
-					unsigned long *bitmap)
+static int kvm_mmu_notifier_test_clear_young(struct mmu_notifier *mn,
+					     struct mm_struct *mm,
+					     unsigned long start,
+					     unsigned long end,
+					     unsigned long *bitmap,
+					     bool clear)
 {
-	trace_kvm_age_hva(start, end);
+	if (kvm_arch_has_fast_test_age_gfn()) {
+		struct test_clear_young_metadata args = {
+			.bitmap		= bitmap,
+			.end		= end,
+			.unreliable	= false,
+		};
+		union kvm_mmu_notifier_arg arg = {
+			.metadata = &args
+		};
+		bool young;
 
-	/* We don't support bitmaps. Don't test or clear anything. */
+		young = kvm_handle_hva_range_no_flush(
+					mn, start, end,
+					clear ? kvm_age_gfn : kvm_test_age_gfn,
+					arg, true);
+		if (!args.unreliable)
+			return young ? MMU_NOTIFIER_YOUNG_FAST : 0;
+	}
+
+	/* Only the fast/lockless path is guaranteed to support a bitmap. */
 	if (bitmap)
 		return MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE;
 
@@ -937,7 +966,21 @@ static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
 	 * cadence. If we find this inaccurate, we might come up with a
 	 * more sophisticated heuristic later.
 	 */
-	return kvm_handle_hva_range_no_flush(mn, start, end, kvm_age_gfn);
+	return kvm_handle_hva_range_no_flush(
+			mn, start, end, clear ? kvm_age_gfn : kvm_test_age_gfn,
+			KVM_MMU_NOTIFIER_NO_ARG, false);
+}
+
+static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
+					struct mm_struct *mm,
+					unsigned long start,
+					unsigned long end,
+					unsigned long *bitmap)
+{
+	trace_kvm_age_hva(start, end);
+
+	return kvm_mmu_notifier_test_clear_young(mn, mm, start, end, bitmap,
+						 true);
 }
 
 static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
@@ -948,12 +991,8 @@ static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
 {
 	trace_kvm_test_age_hva(start, end);
 
-	/* We don't support bitmaps. Don't test or clear anything. */
-	if (bitmap)
-		return MMU_NOTIFIER_YOUNG_BITMAP_UNRELIABLE;
-
-	return kvm_handle_hva_range_no_flush(mn, start, end,
-					     kvm_test_age_gfn);
+	return kvm_mmu_notifier_test_clear_young(mn, mm, start, end, bitmap,
+						 false);
 }
 
 static void kvm_mmu_notifier_release(struct mmu_notifier *mn,
