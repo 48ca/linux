@@ -218,15 +218,19 @@ free_pages:
 	return -ENOMEM;
 }
 
+/*
+ * Copy @src into the first page on @vmemmap_pages and return it. The page is
+ * left on the list; the caller must remove it only once it has successfully
+ * been installed in the vmemmap.
+ */
 static struct page *vmemmap_dup_page_from_list(const struct page *src,
 		struct list_head *vmemmap_pages)
 {
 	struct page *dst = list_first_entry(vmemmap_pages, struct page, lru);
 
-	list_del(&dst->lru);
 	copy_page(page_address(dst), page_address(src));
 
-	/* Ensure updates to @dst page are visible before set_pte_at(). */
+	/* Ensure updates to @dst page are visible before try_update_vmemmap_pte(). */
 	smp_wmb();
 
 	return dst;
@@ -248,6 +252,8 @@ static int vmemmap_optimize_pte(pte_t *pte, unsigned long addr,
 	const struct page *page = (const struct page *)addr;
 	const struct folio *folio = page_folio(page);
 	struct page *src = pte_page(ptep_get(pte)), *dst;
+	bool dup = false;
+	int ret;
 
 	if (likely(vmemmap_optimizable_pfn(page_to_pfn(page), folio_order(folio)))) {
 		dst = folio_vmemmap_shared_tail_page(folio);
@@ -255,16 +261,27 @@ static int vmemmap_optimize_pte(pte_t *pte, unsigned long addr,
 			return -ENOMEM;
 	} else {
 		dst = vmemmap_dup_page_from_list(src, walk->vmemmap_pages);
+		dup = true;
 	}
 
-	list_add(&src->lru, walk->vmemmap_pages);
 	/*
 	 * Map the shared tail page writable intentionally. A lockless get that
 	 * read a non-zero refcount before the remap can still do its cmpxchg
 	 * after it. The refcount is zero, so the cmpxchg fails and leaves the
 	 * page unchanged.
 	 */
-	set_pte_at(&init_mm, addr, pte, mk_pte(dst, PAGE_KERNEL));
+	ret = try_update_vmemmap_pte(addr, pte, mk_pte(dst, PAGE_KERNEL));
+	if (ret)
+		return ret;
+
+	/*
+	 * We successfully overwrote the vmemmap PTE, so the page that was just
+	 * unmapped can be freed, and if we mapped a duplicated page, remove it
+	 * from the list so that it doesn't get freed later.
+	 */
+	if (dup)
+		list_del(&dst->lru);
+	list_add(&src->lru, walk->vmemmap_pages);
 
 	return 0;
 }
@@ -275,6 +292,7 @@ static int vmemmap_restore_pte(pte_t *pte, unsigned long addr,
 	const struct page *page = (const struct page *)addr;
 	const struct folio *folio = page_folio(page);
 	struct page *src = pte_page(ptep_get(pte)), *dst, *tail;
+	int ret;
 
 	if (unlikely(!vmemmap_optimizable_pfn(page_to_pfn(page), folio_order(folio))))
 		return 0;
@@ -291,7 +309,11 @@ static int vmemmap_restore_pte(pte_t *pte, unsigned long addr,
 		return 0;
 
 	dst = vmemmap_dup_page_from_list(src, walk->vmemmap_pages);
-	set_pte_at(&init_mm, addr, pte, mk_pte(dst, PAGE_KERNEL));
+	ret = try_update_vmemmap_pte(addr, pte, mk_pte(dst, PAGE_KERNEL));
+	if (ret)
+		return ret;
+
+	list_del(&dst->lru);
 
 	return 0;
 }
