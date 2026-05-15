@@ -480,6 +480,21 @@ static inline int try_update_vmemmap_pte(unsigned long addr, pte_t *ptep,
 }
 #endif
 
+#ifndef arch_support_vmemmap_remap
+/*
+ * arch_support_vmemmap_remap - Whether in-use vmemmap mappings may be remapped.
+ *
+ * Vmemmap optimizations, such as the HugeTLB vmemmap optimization (HVO),
+ * remap vmemmap page table entries while they are in use. Architectures that
+ * can only do this on some systems may override this hook. It may return false
+ * early during boot and true later, once system-wide features are known.
+ */
+static inline bool arch_support_vmemmap_remap(void)
+{
+	return IS_ENABLED(CONFIG_VMEMMAP_OPTIMIZATION);
+}
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_SET_ACCESS_FLAGS
 extern int ptep_set_access_flags(struct vm_area_struct *vma,
 				 unsigned long address, pte_t *ptep,

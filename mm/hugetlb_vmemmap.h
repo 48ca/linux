@@ -48,6 +48,8 @@ static inline unsigned int hugetlb_vmemmap_optimizable_size(const struct hstate 
 
 	if (!is_power_of_2(sizeof(struct page)))
 		return 0;
+	if (!arch_support_vmemmap_remap())
+		return 0;
 	return size > 0 ? size : 0;
 }
 #else
