@@ -2062,12 +2062,11 @@ static bool has_bbm_through_af(const struct arm64_cpu_capabilities *caps, int sc
 	}
 
 	/*
-	 * We need BBML3 to support Block -> Table transitions without taking
-	 * faults, and we need HW AF support to support changing the OA without
-	 * taking faults. has_cpuid_feature() checks HAFDBS >= AF, reading the
-	 * local CPU's register when verifying a late CPU.
+	 * We need HW AF support to support changing the vmemmap mapping level
+	 * and OA without taking faults. has_cpuid_feature() checks HAFDBS >= AF,
+	 * reading the local CPU's register when verifying a late CPU.
 	 */
-	return cpu_supports_bbml3() && has_cpuid_feature(caps, scope);
+	return has_cpuid_feature(caps, scope);
 }
 
 static void cpu_enable_pan(const struct arm64_cpu_capabilities *__unused)
