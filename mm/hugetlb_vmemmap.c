@@ -274,12 +274,22 @@ static int vmemmap_restore_pte(pte_t *pte, unsigned long addr,
 {
 	const struct page *page = (const struct page *)addr;
 	const struct folio *folio = page_folio(page);
-	struct page *src = pte_page(ptep_get(pte)), *dst;
+	struct page *src = pte_page(ptep_get(pte)), *dst, *tail;
 
 	if (unlikely(!vmemmap_optimizable_pfn(page_to_pfn(page), folio_order(folio))))
 		return 0;
 
-	VM_WARN_ON_ONCE(folio_vmemmap_shared_tail_page(folio) != src);
+	tail = folio_vmemmap_shared_tail_page(folio);
+	if (WARN_ON_ONCE(!tail))
+		return -EINVAL;
+
+	/*
+	 * The folio may be only partially optimized, so restore only PTEs
+	 * currently pointing at the shared tail page.
+	 */
+	if (src != tail)
+		return 0;
+
 	dst = vmemmap_dup_page_from_list(src, walk->vmemmap_pages);
 	set_pte_at(&init_mm, addr, pte, mk_pte(dst, PAGE_KERNEL));
 
@@ -325,6 +335,7 @@ static int vmemmap_pteify_folio(const struct folio *folio, unsigned long flags)
 	return vmemmap_remap_range(start, end, &walk);
 }
 
+#define VMEMMAP_REMAP_INCOMPLETE 1
 /**
  * vmemmap_optimize_folio - optimize the vmemmap backing of a folio
  * @folio:	folio whose vmemmap pages should be optimized.
@@ -340,7 +351,8 @@ static int vmemmap_pteify_folio(const struct folio *folio, unsigned long flags)
  * Note: The caller must hold vmemmap_remap_rwsem. If TLB flushing is deferred,
  * the lock must remain held until the final TLB flush.
  *
- * Return: %0 on success, negative error code otherwise.
+ * Return: %0 on success, VMEMMAP_REMAP_INCOMPLETE if the folio is incompletely
+ *         optimized, negative error code otherwise.
  */
 static int vmemmap_optimize_folio(const struct folio *folio,
 		struct list_head *vmemmap_pages, unsigned long flags)
@@ -372,7 +384,8 @@ static int vmemmap_optimize_folio(const struct folio *folio,
 		return ret;
 
 	end = start + walk.nr_walked * PAGE_SIZE;
-	vmemmap_restore_range(start, end, vmemmap_pages, 0);
+	if (vmemmap_restore_range(start, end, vmemmap_pages, 0))
+		return VMEMMAP_REMAP_INCOMPLETE;
 
 	return ret;
 }
@@ -402,7 +415,12 @@ static int vmemmap_restore_folio(const struct folio *folio, unsigned long flags)
 		return ret;
 
 	guard(rwsem_read)(&vmemmap_remap_rwsem);
-	return vmemmap_restore_range(start, end, &vmemmap_pages, flags);
+	ret = vmemmap_restore_range(start, end, &vmemmap_pages, flags);
+
+	/* Not all pages may have been consumed */
+	free_vmemmap_page_list(&vmemmap_pages);
+
+	return ret;
 }
 
 static bool vmemmap_optimize_enabled = IS_ENABLED(CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP_DEFAULT_ON);
@@ -526,7 +544,11 @@ static int __hugetlb_vmemmap_optimize_folio(const struct hstate *h,
 	 */
 	folio_set_hugetlb_vmemmap_optimized(folio);
 	ret = vmemmap_optimize_folio(folio, vmemmap_pages, flags);
-	if (ret)
+	/*
+	 * If ret == VMEMMAP_REMAP_INCOMPLETE, the folio might be partially
+	 * HVOed. Leave the HVO page folio flag in place.
+	 */
+	if (ret < 0)
 		folio_clear_hugetlb_vmemmap_optimized(folio);
 
 	return ret;
