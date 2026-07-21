@@ -1,0 +1,162 @@
+#ifndef __VIRTIO_VM_COMMON_H
+#define __VIRTIO_VM_COMMON_H
+
+#include <linux/refcount.h>
+#include <linux/rcupdate.h>
+#include <linux/eventfd.h>
+#include <linux/maple_tree.h>
+#include <linux/hashtable.h>
+
+#define VIRTIO_VM_OPEN			(0)
+#define VIRTIO_VM_CLOSE			(1)
+#define VIRTIO_VM_IOCTL			(2)
+#define VIRTIO_VM_CMD_INT		(3)
+#define VIRTIO_VM_DEVICE_MMAP		(4)
+#define VIRTIO_VM_DEVICE_MUNMAP		(5)
+#define VIRTIO_VM_MEMORY_FILE_CREATE	(6)
+#define VIRTIO_VM_MEMORY_FILE_DELETE	(7)
+#define VIRTIO_VM_EVENTFD_GET		(8)
+#define VIRTIO_VM_EVENTFD_PUT		(9)
+#define VIRTIO_VM_EVENTFD_WRITE		(10)
+#define VIRTIO_VM_EVENTFD_POLL		(11)
+#define VIRTIO_VM_FILE_IO		(12)
+#define VIRTIO_VM_READY			(13)
+
+#define VIRTIO_VM_FILEIO_READ		(1)
+#define VIRTIO_VM_FILEIO_WRITE		(2)
+
+#define VIRTIO_VM_IO 0xAF
+#define VIRTIO_VM_IOC_CREATE_MEMORY_FILE _IO(VIRTIO_VM_IO, 0x0)
+
+#define BAR_GUEST_MEM_ALIGNMENT_ORDER PUD_SHIFT /* 1GB */
+
+#define INVALID_PHYS_OFFSET (~0ULL)
+
+extern struct workqueue_struct *eventfd_cleanup_wq;
+
+struct virtio_kvm_req {
+	__le64	handle;
+	__le64	operation;
+	__le64	arg;
+	__le64	longarg;
+} __attribute__((packed));
+
+struct virtio_kvm_resp {
+	__le64	status;
+	__le64	data;
+	__le64	pad;
+} __attribute__((packed));
+
+#define VIRTIO_KVM_POLL_BATCH (1)
+struct virtio_kvm_poll {
+	__le64 status;
+	__le64 handle[VIRTIO_KVM_POLL_BATCH];
+	__le64 vals[VIRTIO_KVM_POLL_BATCH];
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct virtio_kvm_resp) == sizeof(struct virtio_kvm_poll),
+		"sizeof(virtio_kvm_resp) must match sizeof(virtio_kvm_poll)");
+
+struct virtio_kvm_reqresp {
+	struct virtio_kvm_req req;
+	union {
+		struct virtio_kvm_resp resp;
+		struct virtio_kvm_poll poll;
+	};
+};
+
+struct virtkvm_cmd {
+	struct virtio_kvm_reqresp r;
+	struct completion acked;
+	bool free_on_done;
+};
+
+struct virtio_kvm_eventfd {
+	struct hlist_node hnode;
+	struct eventfd_ctx *ctx;
+	u64 handle;	/* L0 handle */
+	u32 id;		/* L1 synthetic ID */
+	refcount_t refcnt;
+	struct rcu_head rcu;
+};
+
+struct virtkvm_alloc_info {
+	struct maple_tree mt;
+	unsigned long range_size;
+};
+
+struct virtkvm_info {
+	struct virtqueue *vq;
+	char name[25];
+	int index;
+
+	resource_size_t phys_start;
+	resource_size_t phys_end;
+
+	/* Synchronizes virtqueue */
+	spinlock_t virtkvm_lock;
+
+	struct work_struct poll_refill;
+	atomic_t poll_pending;
+	struct xarray ioeventfds;
+
+	DECLARE_HASHTABLE(evfd_hash, 8);
+	struct ida evfd_ida;
+	spinlock_t evfd_lock;
+
+	struct virtkvm_alloc_info allocinfo;
+
+	spinlock_t vcpu_lock;
+	struct list_head active_vcpus;
+	wait_queue_head_t vcpu_poll_wait;
+	struct task_struct *polling_thread;
+	wait_queue_head_t vq_wait;
+	bool vq_full;
+};
+
+extern struct virtkvm_info *vi_device;
+
+u64 virtio_vm_get_unused_phys_offset(u64 size, int alignment_order);
+void virtio_vm_put_unused_phys_offset(u64 offset, u64 size);
+
+enum virtio_command_mode {
+	COMMAND_NORMAL = 0,
+	COMMAND_INTERRUPTIBLE = 1,
+	COMMAND_ASYNC = 2,
+};
+
+long __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle, unsigned int operation, unsigned int oparg,
+			unsigned long longarg, u64 *data_out,
+			enum virtio_command_mode mode);
+int virtio_kvm_send_command(u64 handle, unsigned int operation,
+			    unsigned int oparg, unsigned long longarg,
+			    u64 *data_out);
+int virtio_kvm_send_command_async(u64 handle, unsigned int operation,
+			    unsigned int oparg, unsigned long longarg,
+			    u64 *data_out);
+int virtio_kvm_send_command_ucopy(u64 handle, unsigned int operation,
+			    unsigned int oparg, unsigned long longarg, size_t size,
+			    u64 *data);
+int __virtio_kvm_send_command_ucopy(u64 handle, unsigned int operation, unsigned int ioctl,
+				unsigned long arg, size_t size, u64 *data,
+				int always_copy);
+int virtio_kvm_send_command_ucopy_async(u64 handle, unsigned int operation,
+				    unsigned int ioctl, unsigned long arg,
+				    size_t size);
+int virtio_kvm_generic_mmap(u64 handle, struct vm_area_struct *vma,
+			    const struct vm_operations_struct *vm_ops);
+
+int translate_va_to_pa(unsigned long va, unsigned long *phys_addr, size_t size);
+
+bool virtio_kvm_is_gfile(struct file *filp);
+
+ssize_t virtio_kvm_file_read(u64 handle, char __user *user_buffer,
+			     size_t size, loff_t *offset);
+ssize_t virtio_kvm_file_write(u64 handle, const char __user *user_buffer,
+			      size_t size, loff_t *offset);
+long send_dev_munmap(u64 handle, unsigned long phys_offset, unsigned long size);
+
+struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx);
+void virtio_kvm_put_evfd(struct virtio_kvm_eventfd *evfd);
+
+#endif /* __VIRTIO_VM_COMMON_H */

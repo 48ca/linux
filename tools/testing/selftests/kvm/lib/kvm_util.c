@@ -2335,7 +2335,7 @@ void read_stat_data(int stats_fd, struct kvm_stats_header *header,
 		    desc->name, errno, strerror(errno));
 	TEST_ASSERT(ret == size,
 		    "pread() on stat '%s' read %ld bytes, wanted %lu bytes",
-		    desc->name, size, ret);
+		    desc->name, ret, size);
 }
 
 void kvm_get_stat(struct kvm_binary_stats *stats, const char *name,

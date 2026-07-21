@@ -252,7 +252,21 @@ static void test_dirty_log(bool nested_tdp)
 		*vm_get_pte(vm, TEST_GVA(1)) |= PTE_DIRTY_MASK(&vm->mmu);
 	}
 
+#ifdef TACHYON
+#ifndef VIRTIO_VM_IO
+#define VIRTIO_VM_IO 0xAF
+#define VIRTIO_VM_IOC_CREATE_MEMORY_FILE _IO(VIRTIO_VM_IO, 0x0)
+#endif
+	size_t pages = ALIGN(TEST_MEM_PAGES, BITS_PER_BYTE * 4096) / BITS_PER_BYTE;
+	int fd;
+	fd = ioctl(vm->kvm_fd, VIRTIO_VM_IOC_CREATE_MEMORY_FILE, pages);
+	TEST_ASSERT(fd >= 0, "couldn't make bmap file");
+	bmap = mmap(NULL, pages, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	TEST_ASSERT(bmap != MAP_FAILED, "couldn't map bmap");
+	close(fd);
+#else
 	bmap = bitmap_zalloc(TEST_MEM_PAGES);
+#endif
 
 	while (!done) {
 		memset(TEST_HVA(vm, 0), 0xaa, TEST_MEM_PAGES * PAGE_SIZE);

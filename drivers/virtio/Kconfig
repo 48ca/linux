@@ -252,4 +252,16 @@ config VIRTIO_RTC_CLASS
 
 endif # VIRTIO_RTC
 
+config VIRTIO_VM
+	tristate "virtio-vm"
+	depends on VIRTIO && VIRTIO_PCI && X86_64
+	# This module conflicts with module parameters from KVM. They should
+	# not both be built together.
+	depends on !KVM_COMMON
+	default n
+	help
+	  Enable this to provide the paravirtual KVM driver. This will only be
+	  useful if this kernel is running in a VM that is being hosted by a
+	  VMM that implements paravirtual KVM.
+
 endif # VIRTIO_MENU

@@ -142,6 +142,7 @@ int main(int argc, char **argv)
 	}
 
 	sem = sem_open("vm_sem", O_CREAT | O_EXCL, 0644, 0);
+	TEST_ASSERT(sem, "sem_open() failed: errno=%d\n", errno);
 	sem_unlink("vm_sem");
 
 	for (i = 0; i < NR_ITERATIONS; ++i) {

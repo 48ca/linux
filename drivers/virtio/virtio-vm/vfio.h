@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#ifndef __VIRTIO_VM_VFIO_H
+#define __VIRTIO_VM_VFIO_H
+
+#include "common.h"
+
+int virtkvm_vfio_init(struct virtkvm_info *vi);
+void virtkvm_vfio_cleanup(struct virtkvm_info *vi);
+
+bool virtio_kvm_is_vfio_device(const struct vm_area_struct *vma);
+
+#endif /* __VIRTIO_VM_VFIO_H */
