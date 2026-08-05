@@ -379,7 +379,7 @@ release:
 static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct virtkvm_vfio_device *device = filp->private_data;
-	int ret = EOPNOTSUPP;
+	int ret = -EOPNOTSUPP;
 
 	switch (cmd) {
 	case VFIO_DEVICE_GET_INFO: {
