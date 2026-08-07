@@ -198,6 +198,8 @@ static int virtkvm_vfio_set_irqs_get_size(struct vfio_irq_set *irqs,
 
 	*usize = unitsz * irqs->count + sizeof(*irqs);
 	*asize = allocsz * irqs->count + sizeof(*irqs);
+	if (*asize > VIRTKVM_VFIO_MAX_ARGSZ)
+		return -EINVAL;
 
 	return 0;
 }
@@ -267,13 +269,15 @@ static int vfio_translate_eventfds(struct virtkvm_vfio_device *device,
 	}
 
 	if (i < irqs->count) {
-		virtkvm_vfio_free_eventfds(evfds, i);
+		virtkvm_vfio_free_eventfds(evfds, irqs->count);
 		return ret;
 	}
 
 	for (i = 0; i < irqs->count; ++i) {
-		if (!evfds[i])
+		if (!evfds[i]) {
+			handles[i] = INVALID_HANDLE;
 			continue;
+		}
 
 		handles[i] = evfds[i]->handle;
 	}
@@ -364,10 +368,10 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 		oldev = xa_store(&device->irq_ctx, idx, evfds[i], GFP_KERNEL);
 		if (xa_is_err(oldev)) {
 			ret = xa_err(oldev);
-			/* TODO: Unwind properly. */
 			WARN_ON_ONCE(ret);
 			break;
 		}
+		evfds[i] = NULL;
 
 		if (oldev)
 			virtio_kvm_put_evfd(oldev);

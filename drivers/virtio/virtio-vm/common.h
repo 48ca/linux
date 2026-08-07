@@ -32,6 +32,8 @@
 
 #define INVALID_PHYS_OFFSET (~0ULL)
 
+#define INVALID_HANDLE (~0ULL)
+
 extern struct workqueue_struct *eventfd_cleanup_wq;
 
 struct virtio_kvm_req {
