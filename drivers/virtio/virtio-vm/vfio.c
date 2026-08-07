@@ -32,6 +32,21 @@ struct virtkvm_assignable_device_table {
 #define VIRTIO_VM_CLOSE		(1)
 #define VIRTIO_VM_IOCTL		(2)
 
+/*
+* Maximum buffer size for extensible VFIO ioctls passed over RPC.
+*
+* Setting MSI-X interrupts (VFIO_DEVICE_SET_IRQS) expands 32-bit user-space
+* file descriptors into 64-bit eventfd handles in-place. Supporting the full
+* PCIe specification limit of up to 2048 vectors requires 16,404 bytes
+* (20-byte struct vfio_irq_set header + 2048 * 8 bytes).
+*
+* Capping the buffer size at (PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER) (32KB,
+* Order-3) accommodates the maximum 2048 MSI-X vectors and capability descriptor
+* chains while remaining at or below PAGE_ALLOC_COSTLY_ORDER to prevent
+* kmalloc allocation failures under physical memory fragmentation.
+*/
+#define VIRTKVM_VFIO_MAX_ARGSZ		(32 * 1024)
+
 /* virtkvm_vfio has a 1:1 relationship between groups and devices */
 struct virtkvm_vfio_device {
 	char			address[PCI_ADDRESS_LENGTH];
@@ -383,31 +398,55 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsig
 
 	switch (cmd) {
 	case VFIO_DEVICE_GET_INFO: {
-		struct vfio_device_info *dev = kzalloc(sizeof(*dev), GFP_DMA);
+		struct vfio_device_info __user *udev = u64_to_user_ptr((u64)arg);
+		struct vfio_device_info *dev;
+		u32 argsz;
 
+		if (get_user(argsz, &udev->argsz))
+			return -EFAULT;
+
+		if (argsz < offsetofend(struct vfio_device_info, num_irqs) ||
+		    argsz > VIRTKVM_VFIO_MAX_ARGSZ)
+			return -EINVAL;
+
+		dev = kzalloc(argsz, GFP_KERNEL);
 		ret = -ENOMEM;
 		if (!dev)
 			break;
 
-		dev->argsz = sizeof(*dev);
+		if (copy_from_user(dev, udev, argsz)) {
+			ret = -EFAULT;
+			kfree(dev);
+			break;
+		}
+
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(dev), NULL);
 		WARN_ON(ret);
 
-		if (copy_to_user(u64_to_user_ptr((u64)arg), dev, sizeof(*dev)))
+		if (copy_to_user(udev, dev, argsz))
 			ret = -EFAULT;
 
 		kfree(dev);
 		break;
 	}
 	case VFIO_DEVICE_GET_REGION_INFO: {
-		struct vfio_region_info *reg = kzalloc(sizeof(*reg), GFP_DMA);
 		struct vfio_region_info __user *ureg = u64_to_user_ptr((u64)arg);
+		struct vfio_region_info *reg;
+		u32 argsz;
 
+		if (get_user(argsz, &ureg->argsz))
+			return -EFAULT;
+
+		if (argsz < offsetofend(struct vfio_region_info, offset) ||
+		    argsz > VIRTKVM_VFIO_MAX_ARGSZ)
+			return -EINVAL;
+
+		reg = kzalloc(argsz, GFP_KERNEL);
 		ret = -ENOMEM;
 		if (!reg)
 			break;
 
-		if (copy_from_user(reg, ureg, sizeof(*reg))) {
+		if (copy_from_user(reg, ureg, argsz)) {
 			ret = -EFAULT;
 			kfree(reg);
 			break;
@@ -415,45 +454,38 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsig
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(reg), NULL);
 
-		if (copy_to_user(ureg, reg, sizeof(*reg)))
+		if (copy_to_user(ureg, reg, argsz))
 			ret = -EFAULT;
 
 		kfree(reg);
 		break;
 	}
 	case VFIO_DEVICE_GET_IRQ_INFO: {
-		struct vfio_irq_info *irq, kirq;
 		struct vfio_irq_info __user *uirq = u64_to_user_ptr((u64)arg);
+		struct vfio_irq_info *irq;
+		u32 argsz;
 
-		ret = -EFAULT;
-		if (copy_from_user(&kirq, uirq, sizeof(kirq)))
-			break;
+		if (get_user(argsz, &uirq->argsz))
+			return -EFAULT;
 
-		ret = -EFAULT;
-		if (kirq.argsz < sizeof(kirq))
-			break;
+		if (argsz < offsetofend(struct vfio_irq_info, count) ||
+		    argsz > VIRTKVM_VFIO_MAX_ARGSZ)
+			return -EINVAL;
 
-		irq = kzalloc(kirq.argsz, GFP_KERNEL_ACCOUNT);
-
+		irq = kzalloc(argsz, GFP_KERNEL);
 		ret = -ENOMEM;
 		if (!irq)
 			break;
 
-		ret = -EFAULT;
-		if (copy_from_user(irq, uirq, kirq.argsz)) {
-			kfree(irq);
-			break;
-		}
-
-		ret = -EINVAL;
-		if (irq->argsz != kirq.argsz) {
+		if (copy_from_user(irq, uirq, argsz)) {
+			ret = -EFAULT;
 			kfree(irq);
 			break;
 		}
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(irq), NULL);
 
-		if (copy_to_user(uirq, irq, kirq.argsz))
+		if (copy_to_user(uirq, irq, argsz))
 			ret = -EFAULT;
 
 		kfree(irq);
@@ -687,17 +719,32 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 		break;
 	}
 	case VFIO_GROUP_GET_STATUS: {
-		struct vfio_group_status *g = kzalloc(sizeof(*g), GFP_DMA);
+		struct vfio_group_status __user *ug = u64_to_user_ptr((u64)arg);
+		struct vfio_group_status *g;
+		u32 argsz;
 
+		if (get_user(argsz, &ug->argsz))
+			return -EFAULT;
+
+		if (argsz < offsetofend(struct vfio_group_status, flags) ||
+		    argsz > VIRTKVM_VFIO_MAX_ARGSZ)
+			return -EINVAL;
+
+		g = kzalloc(argsz, GFP_KERNEL);
 		ret = -ENOMEM;
 		if (!g)
 			break;
 
-		g->argsz = sizeof(*g);
+		if (copy_from_user(g, ug, argsz)) {
+			ret = -EFAULT;
+			kfree(g);
+			break;
+		}
+
 		ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL, cmd,
 						__pa(g), NULL);
 
-		if (copy_to_user(u64_to_user_ptr((u64)arg), g, sizeof(*g)))
+		if (copy_to_user(ug, g, argsz))
 			ret = -EFAULT;
 
 		kfree(g);
@@ -814,17 +861,33 @@ static long virtkvm_vfio_ioctl(struct file *filp, unsigned int cmd,
 		break;
 	}
 	case VFIO_IOMMU_GET_INFO: {
-		struct vfio_iommu_type1_info *info = kzalloc(sizeof(*info), GFP_DMA);
+		struct vfio_iommu_type1_info __user *uinfo = u64_to_user_ptr((u64)arg);
+		struct vfio_iommu_type1_info *info;
+		u32 argsz;
 
+		if (get_user(argsz, &uinfo->argsz))
+			return -EFAULT;
+
+		if (argsz < offsetofend(struct vfio_iommu_type1_info, iova_pgsizes) ||
+		    argsz > VIRTKVM_VFIO_MAX_ARGSZ)
+			return -EINVAL;
+
+		info = kzalloc(argsz, GFP_KERNEL);
 		ret = -ENOMEM;
 		if (!info)
 			break;
+
+		if (copy_from_user(info, uinfo, argsz)) {
+			ret = -EFAULT;
+			kfree(info);
+			break;
+		}
 
 		ret = virtio_kvm_send_command(container->handle,
 						VIRTIO_VM_IOCTL, cmd,
 						__pa(info), NULL);
 
-		if (copy_to_user(u64_to_user_ptr((u64)arg), info, sizeof(*info)))
+		if (copy_to_user(uinfo, info, argsz))
 			ret = -EFAULT;
 
 		kfree(info);
