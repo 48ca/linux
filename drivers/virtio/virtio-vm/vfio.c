@@ -676,6 +676,7 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 	switch (cmd) {
 	case VFIO_GROUP_GET_DEVICE_FD: {
 		struct virtkvm_vfio_container *container;
+		char dev_name[PCI_ADDRESS_LENGTH];
 		struct file *filep;
 		int fdno;
 		u64 data;
@@ -687,7 +688,11 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 			break;
 		}
 
-		/* check arg == group->assigned_device.address */
+		if (copy_from_user(dev_name, (void __user *)arg, sizeof(dev_name))) {
+			ret = -EFAULT;
+			break;
+		}
+		dev_name[sizeof(dev_name) - 1] = '\0';
 
 		fdno = get_unused_fd_flags(O_CLOEXEC);
 		if (fdno < 0) {
@@ -703,12 +708,11 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 			break;
 		}
 
-		/* TODO: Use the argument the user passed instead of
-		 * group->assigned_device.address.
-		 */
+		memcpy(group->assigned_device.address, dev_name, PCI_ADDRESS_LENGTH);
+
 		ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL,
 						VFIO_GROUP_GET_DEVICE_FD,
-						__pa(&group->assigned_device.address),
+						__pa(group->assigned_device.address),
 						&data);
 		if (ret) {
 			fput(filep);
