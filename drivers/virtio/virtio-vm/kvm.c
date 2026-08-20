@@ -87,11 +87,8 @@ struct virtio_kvm_irqfd_link {
 static int virtio_kvm_ioeventfd_deassign(struct virtio_kvm_vm *vm,
 			      struct virtio_kvm_ioeventfd *ioeventfd);
 
-DEFINE_SPINLOCK(virtio_kvm_lock);
-
 static int poll_idle_timeout_us = 1000;
 module_param(poll_idle_timeout_us, int, 0644);
-static int virtio_kvm_usage_count = 0;
 
 static int
 virtio_kvm_handle_msr_list(u64 handle, unsigned int ioctl, unsigned long arg, u64 *data)
@@ -1911,15 +1908,7 @@ virtio_kvm_vm_release(struct inode *inode, struct file *filp)
 	struct virtio_kvm_ioeventfd_link *ioeventfd, *tmp_ioeventfd;
 	struct virtio_kvm_irqfd_link *irqfd, *tmp_irqfd;
 	u64 handle = vm->handle;
-	unsigned long iflags;
 	int ret;
-
-	/* Decrement vm usage count to zero; if poll work returns while there
-	 * are no VMs, we will not re-arm VIRTIO_VM_POLL.
-	 */
-	spin_lock_irqsave(&virtio_kvm_lock, iflags);
-	virtio_kvm_usage_count--;
-	spin_unlock_irqrestore(&virtio_kvm_lock, iflags);
 
 	/* Free all memory regions. No need to grab the lock. */
 	list_for_each_entry_safe(reg, tmp_reg, &vm->memory_regions, link) {
@@ -2026,7 +2015,6 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	u64 data;
 	int err;
 	int fd;
-	unsigned long flags;
 
 #define CASE_KVM_IOCTL_BASIC(ioc_name) \
 	case ioc_name: \
@@ -2110,11 +2098,6 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 			return err;
 		}
 		fd_install(fd, file);
-
-		spin_lock_irqsave(&virtio_kvm_lock, flags);
-		if (virtio_kvm_usage_count++ == 0)
-			queue_work(eventfd_cleanup_wq, &vi_device->poll_refill);
-		spin_unlock_irqrestore(&virtio_kvm_lock, flags);
 
 		return fd;
 	}

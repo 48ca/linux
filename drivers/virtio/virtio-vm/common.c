@@ -137,7 +137,8 @@ void virtio_kvm_eventfd_poll_done(struct virtio_kvm_poll *poll)
 	rcu_read_unlock();
 
 	atomic_set(&vi_device->poll_pending, 0);
-	queue_work(eventfd_cleanup_wq, &vi_device->poll_refill);
+	if (!xa_empty(&vi_device->ioeventfds))
+		queue_work(eventfd_cleanup_wq, &vi_device->poll_refill);
 }
 
 static void kvm_request_done(struct virtkvm_cmd *cmd)
@@ -647,6 +648,9 @@ static void refill_work(struct work_struct *work)
 
 	vi = container_of(work, struct virtkvm_info, poll_refill);
 
+	if (xa_empty(&vi->ioeventfds))
+		return;
+
 	if (atomic_cmpxchg_relaxed(&vi->poll_pending, 0, 1))
 		return;
 
@@ -742,6 +746,8 @@ struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx)
 	trace_virtio_vm_ioeventfd_add(handle, id);
 	hash_add(vi_device->evfd_hash, &new_evfd->hnode, (unsigned long)ctx);
 	spin_unlock(&vi_device->evfd_lock);
+
+	queue_work(eventfd_cleanup_wq, &vi_device->poll_refill);
 
 	return new_evfd;
 }
