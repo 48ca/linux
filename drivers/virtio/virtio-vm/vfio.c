@@ -350,49 +350,61 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 		goto release;
 	}
 
-	if (!evfds)
+	if (!evfds) {
+		if ((irqs->flags & VFIO_IRQ_SET_ACTION_TRIGGER) &&
+		    (irqs->flags & VFIO_IRQ_SET_DATA_NONE)) {
+			for (i = 0; i < irqs->count; ++i) {
+				struct virtio_kvm_eventfd *old_evfd;
+
+				old_evfd = xa_erase(&device->irq_ctx, irqs->start + i);
+				if (old_evfd)
+					virtio_kvm_put_evfd(old_evfd);
+			}
+		}
 		/* No need to track eventfds. We are done! */
 		goto free;
+	}
 
 	for (i = 0; i < irqs->count; ++i) {
-		struct virtio_kvm_eventfd *oldev;
-		int idx = irqs->start + i;
+		struct virtio_kvm_eventfd *old_evfd;
 
 		if (!evfds[i]) {
-			oldev = xa_erase(&device->irq_ctx, idx);
-			if (oldev)
-				virtio_kvm_put_evfd(oldev);
+			old_evfd = xa_erase(&device->irq_ctx, irqs->start + i);
+			if (old_evfd)
+				virtio_kvm_put_evfd(old_evfd);
 			continue;
 		}
 
-		oldev = xa_store(&device->irq_ctx, idx, evfds[i], GFP_KERNEL);
-		if (xa_is_err(oldev)) {
-			ret = xa_err(oldev);
-			WARN_ON_ONCE(ret);
+		old_evfd = xa_store(&device->irq_ctx, irqs->start + i, evfds[i],
+				    GFP_KERNEL);
+		if (WARN_ON(xa_is_err(old_evfd))) {
+			ret = xa_err(old_evfd);
 			break;
 		}
-		evfds[i] = NULL;
 
-		if (oldev)
-			virtio_kvm_put_evfd(oldev);
+		if (old_evfd)
+			virtio_kvm_put_evfd(old_evfd);
 	}
 
-	/* Don't leak any eventfds we didn't store */
-	for (; i < irqs->count; ++i) {
-		if (evfds[i])
-			virtio_kvm_put_evfd(evfds[i]);
-	}
+	if (ret)
+		goto release;
 
-	queue_work(eventfd_cleanup_wq, &vi_device->poll_refill);
-
-free:
 	kfree(evfds);
 	kfree(irqs);
-	return ret;
+
+	return 0;
+
 release:
-	for (; xa_idx >= 0; --xa_idx)
-		xa_release(&device->irq_ctx, irqs->start + xa_idx);
-	goto free;
+	if (evfds) {
+		for (i = 0; i < xa_idx; ++i) {
+			if (evfds[i])
+				xa_release(&device->irq_ctx, irqs->start + i);
+		}
+		virtkvm_vfio_free_eventfds(evfds, irqs->count);
+	}
+free:
+	kfree(irqs);
+	return ret;
 }
 
 static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
