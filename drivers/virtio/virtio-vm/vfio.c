@@ -328,11 +328,8 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 				continue;
 			ret = xa_reserve(&device->irq_ctx, irqs->start + xa_idx, GFP_KERNEL);
 			if (ret)
-				break;
+				goto release;
 		}
-
-		if (xa_idx < irqs->count)
-			goto release;
 	}
 
 	/* Make the translation easier for L0 by specifying the new size
@@ -341,14 +338,8 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 
 	ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL,
 				      VFIO_DEVICE_SET_IRQS, __pa(irqs), NULL);
-	if (WARN_ON(ret)) {
-		if (evfds) {
-			virtkvm_vfio_free_eventfds(evfds, irqs->count);
-			/* virtio_kvm_vfio_free_eventfds frees evfds */
-			evfds = NULL;
-		}
+	if (WARN_ON(ret))
 		goto release;
-	}
 
 	if (!evfds) {
 		if ((irqs->flags & VFIO_IRQ_SET_ACTION_TRIGGER) &&
@@ -377,17 +368,16 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 
 		old_evfd = xa_store(&device->irq_ctx, irqs->start + i, evfds[i],
 				    GFP_KERNEL);
-		if (WARN_ON(xa_is_err(old_evfd))) {
-			ret = xa_err(old_evfd);
-			break;
-		}
+		/*
+		 * xa_store is not expected to fail here because the slot was
+		 * pre-allocated by xa_reserve().
+		 */
+		if (WARN_ON(xa_is_err(old_evfd)))
+			continue;
 
 		if (old_evfd)
 			virtio_kvm_put_evfd(old_evfd);
 	}
-
-	if (ret)
-		goto release;
 
 	kfree(evfds);
 	kfree(irqs);
