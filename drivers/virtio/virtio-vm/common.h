@@ -22,6 +22,11 @@
 #define VIRTIO_VM_EVENTFD_POLL		(11)
 #define VIRTIO_VM_FILE_IO		(12)
 #define VIRTIO_VM_READY			(13)
+#define VIRTIO_VM_VFIO_OPEN		(64)
+#define VIRTIO_VM_VFIO_GROUP_OPEN	(65)
+#define VIRTIO_VM_VFIO_DEVICE_READ	(66)
+#define VIRTIO_VM_VFIO_DEVICE_WRITE	(67)
+#define VIRTIO_VM_VFIO_GET_GROUPS	(68)
 
 #define VIRTIO_VM_FILEIO_READ		(1)
 #define VIRTIO_VM_FILEIO_WRITE		(2)
@@ -133,6 +138,10 @@ struct virtio_kvm_partition {
 	char name[32];
 	char nodename[64];
 	struct miscdevice misc_dev;
+	struct miscdevice vfio_container_dev;
+	char vfio_container_name[32];
+	char vfio_container_nodename[64];
+	struct list_head vfio_groups;
 	struct list_head link;
 	struct virtkvm_info *vi;
 	atomic_t refcnt;

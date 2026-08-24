@@ -3,7 +3,10 @@
 #ifndef __VIRTIO_VM_VFIO_H
 #define __VIRTIO_VM_VFIO_H
 
-#include "common.h"
+struct virtio_kvm_partition;
+
+int virtkvm_partition_init_vfio(struct virtio_kvm_partition *part);
+void virtkvm_partition_cleanup_vfio(struct virtio_kvm_partition *part);
 
 int virtkvm_vfio_init(struct virtkvm_info *vi);
 void virtkvm_vfio_cleanup(struct virtkvm_info *vi);

@@ -2,35 +2,17 @@
 #include <linux/file.h>
 #include <linux/miscdevice.h>
 #include <linux/vfio.h>
+#include <linux/slab.h>
 
 #include "common.h"
+#include "kvm.h"
 #include "vfio.h"
 #include "trace.h"
 
 #undef pr_fmt
 #define pr_fmt(fmt) "virtio-vm: vfio: " fmt
 
-/* UAPI */
 #define PCI_ADDRESS_LENGTH	(16)
-
-struct virtkvm_assignable_device_entry {
-	char address[PCI_ADDRESS_LENGTH];	/* "0000:00:00.0" */
-	u32 l0_group;
-};
-struct virtkvm_assignable_device_table {
-	int nent;
-	struct virtkvm_assignable_device_entry entries[];
-};
-
-#define VIRTIO_VM_VFIO_OPEN		(64)
-#define VIRTIO_VM_VFIO_GROUP_OPEN	(65)
-/* TODO: Partly duplicative with VIRTIO_VM_EVENTFD_WRITE, VIRTIO_VM_STATS_READ */
-#define VIRTIO_VM_VFIO_DEVICE_READ	(66)
-#define VIRTIO_VM_VFIO_DEVICE_WRITE	(67)
-
-/* TODO: Redefinitions from virtio-kvm */
-#define VIRTIO_VM_CLOSE		(1)
-#define VIRTIO_VM_IOCTL		(2)
 
 /*
 * Maximum buffer size for extensible VFIO ioctls passed over RPC.
@@ -47,42 +29,52 @@ struct virtkvm_assignable_device_table {
 */
 #define VIRTKVM_VFIO_MAX_ARGSZ		(32 * 1024)
 
-/* virtkvm_vfio has a 1:1 relationship between groups and devices */
 struct virtkvm_vfio_device {
-	char			address[PCI_ADDRESS_LENGTH];
-	u64			handle;
+	char				address[PCI_ADDRESS_LENGTH];
+	u64				handle;
+	u64				partition_id;
+	struct virtkvm_vfio_group	*group;
+	struct virtkvm_vfio_container	*container;
+	struct virtio_kvm_partition	*part;
 
-	struct xarray		irq_ctx;
+	struct xarray			irq_ctx;
 };
 
 struct virtkvm_vfio_container {
 	struct kref		kref;
 	struct list_head	group_list;
 	u64			handle;
+	u64			partition_id;
+	struct virtio_kvm_partition *part;
 };
 
 struct virtkvm_vfio_group {
-	struct device		dev;
-	struct cdev		cdev;
-	int			l0_group;
-	u64			handle;
-	int			opened;
-	int			device_fd_count;
+	struct list_head		link;
+	struct miscdevice		misc_dev;
+	struct kref			kref;
+	char				name[32];
+	char				nodename[64];
+	u64				group_id;
+	u64				partition_id;
+	u64				handle;
+	int				opened;
+	int				device_fd_count;
 
-	struct virtkvm_vfio_device	assigned_device;
 	struct virtkvm_vfio_container	*container;
+	struct virtio_kvm_partition	*part;
 };
-
-static struct virtkvm_vfio {
-	struct class		*class;
-	int			group_alloc;
-	dev_t			group_devt;
-} virtkvm_vfio;
 
 /* Protects container <-> group binding */
 static DEFINE_MUTEX(virtkvm_vfio_lock);
 
 static void virtkvm_vfio_container_release(struct kref *kref);
+
+static void virtkvm_vfio_group_release_kref(struct kref *kref)
+{
+	struct virtkvm_vfio_group *group =
+		container_of(kref, struct virtkvm_vfio_group, kref);
+	kfree(group);
+}
 
 /*
  * Device objects
@@ -90,32 +82,34 @@ static void virtkvm_vfio_container_release(struct kref *kref);
 static int virtkvm_vfio_device_release(struct inode *inode, struct file *filp)
 {
 	struct virtkvm_vfio_device *device = filp->private_data;
-	struct virtkvm_vfio_group *group = container_of(device, struct virtkvm_vfio_group, assigned_device);
+	struct virtkvm_vfio_group *group = device->group;
 	struct virtio_kvm_eventfd *evfd;
 	unsigned long idx;
 	int ret;
 
-	group->device_fd_count--;
-	put_device(&group->dev);
+	if (group) {
+		group->device_fd_count--;
+		kref_put(&group->kref, virtkvm_vfio_group_release_kref);
+	}
 
 	ret = virtio_kvm_send_command_async(device->handle, VIRTIO_VM_CLOSE, 0, 0, NULL);
 	WARN_ON_ONCE(ret);
 
 	/* Pairs with kref_get in GET_DEVICE_FD */
-	kref_put(&group->container->kref, virtkvm_vfio_container_release);
+	if (device->container)
+		kref_put(&device->container->kref, virtkvm_vfio_container_release);
 
 	xa_for_each(&device->irq_ctx, idx, evfd) {
 		virtio_kvm_put_evfd(evfd);
 	}
+	xa_destroy(&device->irq_ctx);
+
+	virtkvm_partition_put(device->part);
+	kfree(device);
 
 	return ret;
 }
 
-struct virtkvm_vfio_device_rw {		/* ABI */
-	loff_t ppos;
-	size_t count;
-	char kbuf[];
-};
 static ssize_t virtkvm_vfio_device_read(struct file *filp, char __user *buf,
 					size_t count, loff_t *ppos)
 {
@@ -205,40 +199,43 @@ static int virtkvm_vfio_set_irqs_get_size(struct vfio_irq_set *irqs,
 }
 
 static void virtkvm_vfio_free_eventfds(struct virtio_kvm_eventfd **evfds,
-				       int count)
+				       size_t count)
 {
 	int i;
 
-	for (i = 0; i < count; ++i)
+	for (i = 0; i < count; ++i) {
 		if (evfds[i])
 			virtio_kvm_put_evfd(evfds[i]);
+	}
 
 	kfree(evfds);
 }
 
-static int vfio_translate_eventfds(struct virtkvm_vfio_device *device,
-				   struct vfio_irq_set *irqs,
-				   struct virtio_kvm_eventfd ***out_evfds)
+static int
+vfio_translate_eventfds(struct virtkvm_vfio_device *device,
+			struct vfio_irq_set *irqs,
+			struct virtio_kvm_eventfd ***out_evfds)
 {
-
 	struct virtio_kvm_eventfd **evfds;
-	u64 *handles;
-	int *fds;
+	u64 *handles = (u64 *)irqs->data;
+	int32_t *fds = (int32_t *)irqs->data;
 	int ret = 0;
 	int i;
 
-	if (!((irqs->flags & VFIO_IRQ_SET_DATA_TYPE_MASK) &
-	      VFIO_IRQ_SET_DATA_EVENTFD))
+	if ((irqs->flags & VFIO_IRQ_SET_DATA_TYPE_MASK) != VFIO_IRQ_SET_DATA_EVENTFD) {
+		*out_evfds = NULL;
 		return 0;
+	}
 
-	evfds = kzalloc(irqs->count * sizeof(*evfds), GFP_KERNEL);
+	/*
+	 * Allocate array in reverse because we are converting in-place from
+	 * int32 to uint64.
+	 */
+	evfds = kcalloc(irqs->count, sizeof(*evfds), GFP_KERNEL_ACCOUNT);
 	if (!evfds)
 		return -ENOMEM;
 
-	fds = (int *)irqs->data;
-	handles = (u64 *)irqs->data;
-
-	for (i = 0; i < irqs->count; ++i) {
+	for (i = irqs->count - 1; i >= 0; --i) {
 		struct virtio_kvm_eventfd *evfd;
 		struct eventfd_ctx *eventfd;
 
@@ -259,7 +256,7 @@ static int vfio_translate_eventfds(struct virtkvm_vfio_device *device,
 			break;
 		}
 
-		evfd = virtio_kvm_get_evfd(0, eventfd);
+		evfd = virtio_kvm_get_evfd(device->partition_id, eventfd);
 		if (IS_ERR(evfd)) {
 			eventfd_ctx_put(eventfd);
 			ret = PTR_ERR(evfd);
@@ -397,14 +394,16 @@ free:
 	return ret;
 }
 
-static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd,
+				      unsigned long arg)
 {
 	struct virtkvm_vfio_device *device = filp->private_data;
-	int ret = -EOPNOTSUPP;
+	void __user *uarg = (void __user *) arg;
+	int ret = -ENOTTY;
 
 	switch (cmd) {
 	case VFIO_DEVICE_GET_INFO: {
-		struct vfio_device_info __user *udev = u64_to_user_ptr((u64)arg);
+		struct vfio_device_info __user *udev = uarg;
 		struct vfio_device_info *dev;
 		u32 argsz;
 
@@ -427,16 +426,15 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsig
 		}
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(dev), NULL);
-		WARN_ON(ret);
 
-		if (copy_to_user(udev, dev, argsz))
+		if (!ret && copy_to_user(udev, dev, argsz))
 			ret = -EFAULT;
 
 		kfree(dev);
 		break;
 	}
 	case VFIO_DEVICE_GET_REGION_INFO: {
-		struct vfio_region_info __user *ureg = u64_to_user_ptr((u64)arg);
+		struct vfio_region_info __user *ureg = uarg;
 		struct vfio_region_info *reg;
 		u32 argsz;
 
@@ -460,14 +458,14 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsig
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(reg), NULL);
 
-		if (copy_to_user(ureg, reg, argsz))
+		if (!ret && copy_to_user(ureg, reg, argsz))
 			ret = -EFAULT;
 
 		kfree(reg);
 		break;
 	}
 	case VFIO_DEVICE_GET_IRQ_INFO: {
-		struct vfio_irq_info __user *uirq = u64_to_user_ptr((u64)arg);
+		struct vfio_irq_info __user *uirq = uarg;
 		struct vfio_irq_info *irq;
 		u32 argsz;
 
@@ -491,7 +489,7 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsig
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(irq), NULL);
 
-		if (copy_to_user(uirq, irq, argsz))
+		if (!ret && copy_to_user(uirq, irq, argsz))
 			ret = -EFAULT;
 
 		kfree(irq);
@@ -526,51 +524,12 @@ const struct file_operations virtkvm_vfio_device_fops = {
 };
 
 static const struct file_operations virtkvm_vfio_fops;
-static const struct file_operations virtkvm_vfio_group_fops;
-
-static void virtkvm_vfio_group_dev_release(struct device *dev)
-{
-	struct virtkvm_vfio_group *group = container_of(dev, struct virtkvm_vfio_group, dev);
-	kfree(group);
-}
-
-static int virtkvm_vfio_create_group(struct virtkvm_assignable_device_entry *device)
-{
-	struct virtkvm_vfio_group *group;
-	int num;
-
-	group = kzalloc(sizeof(*group), GFP_KERNEL);
-	if (!group)
-		return -ENOMEM;
-
-	num = virtkvm_vfio.group_alloc++;
-
-	device_initialize(&group->dev);
-	group->dev.devt = MKDEV(MAJOR(virtkvm_vfio.group_devt), num);
-	group->dev.class = virtkvm_vfio.class;
-	group->dev.release = virtkvm_vfio_group_dev_release;
-	cdev_init(&group->cdev, &virtkvm_vfio_group_fops);
-	group->cdev.owner = THIS_MODULE;
-
-	dev_set_name(&group->dev, "group%d", num);
-	cdev_device_add(&group->cdev, &group->dev);
-
-	group->l0_group = device->l0_group;
-	pr_info("virtio-vm: vfio: Device %s group %d, major:minor %d:%d\n",
-		device->address, num, MAJOR(group->dev.devt),
-		MINOR(group->dev.devt));
-	/* TODO: Generate udev event here? */
-
-	memcpy(group->assigned_device.address, device->address, PCI_ADDRESS_LENGTH);
-	group->opened = 0;
-
-	return 0;
-}
 
 static int virtkvm_vfio_group_open(struct inode *inode, struct file *filp)
 {
+	struct miscdevice *misc = filp->private_data;
 	struct virtkvm_vfio_group *group =
-		container_of(inode->i_cdev, struct virtkvm_vfio_group, cdev);
+		container_of(misc, struct virtkvm_vfio_group, misc_dev);
 	u64 data;
 	int ret;
 
@@ -579,14 +538,28 @@ static int virtkvm_vfio_group_open(struct inode *inode, struct file *filp)
 	if (group->opened)
 		return -EBUSY;
 
-	ret = virtio_kvm_send_command(-1,
-					VIRTIO_VM_VFIO_GROUP_OPEN, group->l0_group, 0, &data);
-	if (WARN_ON_ONCE(ret))
+	if (group->part && group->part->vi) {
+		mutex_lock(&group->part->vi->partition_lock);
+		if (list_empty(&group->part->link)) {
+			mutex_unlock(&group->part->vi->partition_lock);
+			return -ENODEV;
+		}
+		virtkvm_partition_get(group->part);
+		mutex_unlock(&group->part->vi->partition_lock);
+	}
+
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_VFIO_GROUP_OPEN,
+				      group->partition_id, group->group_id,
+				      &data);
+	if (ret) {
+		virtkvm_partition_put(group->part);
 		return ret;
+	}
 
 	group->opened = 1;
 	group->handle = data;
 	group->container = NULL;
+	kref_get(&group->kref);
 	filp->private_data = group;
 
 	return 0;
@@ -613,7 +586,10 @@ static int virtkvm_vfio_group_release(struct inode *inode, struct file *filp)
 
 		group->handle = -1;
 		group->opened = 0;
+		virtkvm_partition_put(group->part);
 	}
+
+	kref_put(&group->kref, virtkvm_vfio_group_release_kref);
 
 	return 0;
 }
@@ -641,9 +617,13 @@ static int virtkvm_vfio_group_ioctl_set_container(struct virtkvm_vfio_group *gro
 	if (group->container)
 		return -EBUSY;
 
-	BUG_ON(group->opened == 0);
+	if (WARN_ON(!group->opened))
+		return -EINVAL;
 
 	container = fd_file(f)->private_data;
+
+	if (group->partition_id != container->partition_id)
+		return -EINVAL;
 
 	ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL, VFIO_GROUP_SET_CONTAINER, container->handle, NULL);
 	if (!ret) {
@@ -658,14 +638,14 @@ static int virtkvm_vfio_group_ioctl_unset_container(struct virtkvm_vfio_group *g
 						  void __user *argp)
 {
 	lockdep_assert_held(&virtkvm_vfio_lock);
-	return -1;
+	return -EOPNOTSUPP;
 }
 
 static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct virtkvm_vfio_group *group = filp->private_data;
 	void __user *uarg = (void __user *) arg;
-	int ret = -ENOSYS;
+	int ret = -ENOTTY;
 
 	guard(mutex)(&virtkvm_vfio_lock);
 
@@ -676,6 +656,8 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 		struct file *filep;
 		int fdno;
 		u64 data;
+
+		struct virtkvm_vfio_device *device;
 
 		container = group->container;
 
@@ -696,19 +678,27 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 			break;
 		}
 
+		device = kzalloc(sizeof(*device), GFP_KERNEL);
+		if (!device) {
+			put_unused_fd(fdno);
+			ret = -ENOMEM;
+			break;
+		}
+
+		memcpy(device->address, dev_name, PCI_ADDRESS_LENGTH);
+
 		filep = anon_inode_getfile_fmode("[virtkvm-vfio-device]", &virtkvm_vfio_device_fops,
-				&group->assigned_device, O_RDWR, FMODE_PREAD | FMODE_PWRITE);
+				device, O_RDWR, FMODE_PREAD | FMODE_PWRITE);
 		if (IS_ERR(filep)) {
+			kfree(device);
 			put_unused_fd(fdno);
 			ret = PTR_ERR(filep);
 			break;
 		}
 
-		memcpy(group->assigned_device.address, dev_name, PCI_ADDRESS_LENGTH);
-
 		ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL,
 						VFIO_GROUP_GET_DEVICE_FD,
-						__pa(group->assigned_device.address),
+						__pa(device->address),
 						&data);
 		if (ret) {
 			fput(filep);
@@ -716,12 +706,17 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 			break;
 		}
 
-		group->assigned_device.handle = data;
+		device->handle = data;
+		device->partition_id = group->partition_id;
+		device->group = group;
+		device->container = container;
+		device->part = group->part;
+		virtkvm_partition_get(device->part);
 
+		kref_get(&group->kref);
 		kref_get(&container->kref);
-		get_device(&group->dev);
 		group->device_fd_count++;
-		xa_init(&group->assigned_device.irq_ctx);
+		xa_init(&device->irq_ctx);
 
 		fd_install(fdno, filep);
 		ret = fdno;
@@ -754,7 +749,7 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 		ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL, cmd,
 						__pa(g), NULL);
 
-		if (copy_to_user(ug, g, argsz))
+		if (!ret && copy_to_user(ug, g, argsz))
 			ret = -EFAULT;
 
 		kfree(g);
@@ -837,7 +832,7 @@ static int virtkvm_vfio_unmap_dma(struct virtkvm_vfio_container *container,
 	ret = virtio_kvm_send_command(container->handle, VIRTIO_VM_IOCTL,
 				      VFIO_IOMMU_UNMAP_DMA, __pa(unmap), NULL);
 
-	if (copy_to_user(u64_to_user_ptr((u64)arg), unmap, sizeof(*unmap)))
+	if (!ret && copy_to_user(u64_to_user_ptr((u64)arg), unmap, sizeof(*unmap)))
 		ret = -EFAULT;
 
 out:
@@ -849,7 +844,7 @@ static long virtkvm_vfio_ioctl(struct file *filp, unsigned int cmd,
 			       unsigned long arg)
 {
 	struct virtkvm_vfio_container *container = filp->private_data;
-	int ret = 0;
+	int ret = -ENOTTY;
 
 	switch (cmd) {
 	case VFIO_GET_API_VERSION: {
@@ -897,7 +892,7 @@ static long virtkvm_vfio_ioctl(struct file *filp, unsigned int cmd,
 						VIRTIO_VM_IOCTL, cmd,
 						__pa(info), NULL);
 
-		if (copy_to_user(uinfo, info, argsz))
+		if (!ret && copy_to_user(uinfo, info, argsz))
 			ret = -EFAULT;
 
 		kfree(info);
@@ -918,7 +913,8 @@ static long virtkvm_vfio_ioctl(struct file *filp, unsigned int cmd,
 	return ret;
 }
 
-static void virtkvm_vfio_container_release(struct kref *kref) {
+static void virtkvm_vfio_container_release(struct kref *kref)
+{
 	struct virtkvm_vfio_container *container =
 		container_of(kref, struct virtkvm_vfio_container, kref);
 	int ret;
@@ -926,31 +922,47 @@ static void virtkvm_vfio_container_release(struct kref *kref) {
 	ret = virtio_kvm_send_command_async(container->handle, VIRTIO_VM_CLOSE, 0, 0, NULL);
 	WARN_ON_ONCE(ret);
 
+	virtkvm_partition_put(container->part);
 	kfree(container);
 }
 
-static int virtkvm_vfio_open(struct inode * inode, struct file *filp)
+static int virtkvm_vfio_open(struct inode *inode, struct file *filp)
 {
+	struct miscdevice *misc = filp->private_data;
+	struct virtio_kvm_partition *part =
+		container_of(misc, struct virtio_kvm_partition, vfio_container_dev);
 	struct virtkvm_vfio_container *container;
+	u64 partition_id = part ? part->partition_id : 0;
 	u64 data;
 	int ret;
 
-	printk(KERN_EMERG "virtkvm_vfio_open\n");
 	container = kzalloc(sizeof(*container), GFP_KERNEL_ACCOUNT);
 	if (!container)
 		return -ENOMEM;
 
-	ret = virtio_kvm_send_command(-1, VIRTIO_VM_VFIO_OPEN, 0, 0, &data);
-	if (ret) {
-		kfree(container);
-		return -ENOSYS;
+	if (part && part->vi) {
+		mutex_lock(&part->vi->partition_lock);
+		if (list_empty(&part->link)) {
+			mutex_unlock(&part->vi->partition_lock);
+			kfree(container);
+			return -ENODEV;
+		}
+		virtkvm_partition_get(part);
+		mutex_unlock(&part->vi->partition_lock);
 	}
 
-	/* |data| is an L0 handle referencing /dev/vfio/vfio */
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_VFIO_OPEN, partition_id, 0, &data);
+	if (ret) {
+		virtkvm_partition_put(part);
+		kfree(container);
+		return ret;
+	}
 
 	INIT_LIST_HEAD(&container->group_list);
 	kref_init(&container->kref);
 	container->handle = data;
+	container->partition_id = partition_id;
+	container->part = part;
 
 	filp->private_data = container;
 
@@ -975,55 +987,106 @@ static const struct file_operations virtkvm_vfio_fops = {
 	.release = virtkvm_vfio_release,
 };
 
-struct miscdevice virtkvm_vfio_dev = {
-	.minor = VFIO_MINOR,
-	.name = "vfio",
-	.fops = &virtkvm_vfio_fops,
-	.nodename = "vfio/vfio",
-};
+int virtkvm_partition_init_vfio(struct virtio_kvm_partition *part)
+{
+	u64 *groups;
+	u64 num_groups = 0;
+	int err, i;
 
-static int virtkvm_add_ivb_cbdma(void) {
-	struct virtkvm_assignable_device_entry e;
+	snprintf(part->vfio_container_name, sizeof(part->vfio_container_name),
+		 "tachyon-%llu-vfio", part->partition_id);
+	snprintf(part->vfio_container_nodename, sizeof(part->vfio_container_nodename),
+		 "tachyon-%llu/vfio/vfio", part->partition_id);
+	part->vfio_container_dev.minor = MISC_DYNAMIC_MINOR;
+	part->vfio_container_dev.name = part->vfio_container_name;
+	part->vfio_container_dev.nodename = part->vfio_container_nodename;
+	part->vfio_container_dev.mode = 0666;
+	part->vfio_container_dev.fops = &virtkvm_vfio_fops;
 
-	sprintf(e.address, "0000:00:04.0");
-	e.l0_group = 22;  // IVB CBDMA ch0
+	err = misc_register(&part->vfio_container_dev);
+	if (err)
+		return err;
 
-	return virtkvm_vfio_create_group(&e);
+	err = virtio_kvm_send_command(-1, VIRTIO_VM_VFIO_GET_GROUPS,
+				      part->partition_id, 0, &num_groups);
+	if (err) {
+		pr_warn("Failed to query VFIO groups for partition %llu: %d\n",
+			part->partition_id, err);
+		return 0;
+	}
+
+	if (num_groups == 0)
+		return 0;
+
+	groups = kmalloc_array(num_groups, sizeof(u64), GFP_KERNEL);
+	if (!groups) {
+		misc_deregister(&part->vfio_container_dev);
+		return -ENOMEM;
+	}
+
+	err = virtio_kvm_send_command(-1, VIRTIO_VM_VFIO_GET_GROUPS,
+				      part->partition_id, __pa(groups), &num_groups);
+	if (err) {
+		pr_warn("Failed to get VFIO groups for partition %llu from host: %d\n",
+			part->partition_id, err);
+		kfree(groups);
+		return 0;
+	}
+
+	for (i = 0; i < num_groups; i++) {
+		struct virtkvm_vfio_group *group;
+
+		group = kzalloc(sizeof(*group), GFP_KERNEL);
+		if (!group)
+			continue;
+
+		group->group_id = groups[i];
+		group->partition_id = part->partition_id;
+		group->part = part;
+		kref_init(&group->kref);
+		snprintf(group->name, sizeof(group->name),
+			 "tachyon-%llu-vfio-%llu", part->partition_id, group->group_id);
+		snprintf(group->nodename, sizeof(group->nodename),
+			 "tachyon-%llu/vfio/%llu", part->partition_id, group->group_id);
+		group->misc_dev.minor = MISC_DYNAMIC_MINOR;
+		group->misc_dev.name = group->name;
+		group->misc_dev.nodename = group->nodename;
+		group->misc_dev.mode = 0666;
+		group->misc_dev.fops = &virtkvm_vfio_group_fops;
+
+		err = misc_register(&group->misc_dev);
+		if (err) {
+			kfree(group);
+			continue;
+		}
+
+		list_add_tail(&group->link, &part->vfio_groups);
+		pr_info("Registered VFIO group device /dev/%s for partition %llu\n",
+			group->nodename, part->partition_id);
+	}
+
+	kfree(groups);
+	return 0;
+}
+
+void virtkvm_partition_cleanup_vfio(struct virtio_kvm_partition *part)
+{
+	struct virtkvm_vfio_group *group, *tmp;
+
+	list_for_each_entry_safe(group, tmp, &part->vfio_groups, link) {
+		list_del(&group->link);
+		misc_deregister(&group->misc_dev);
+		kref_put(&group->kref, virtkvm_vfio_group_release_kref);
+	}
+
+	misc_deregister(&part->vfio_container_dev);
 }
 
 int virtkvm_vfio_init(struct virtkvm_info *vi)
 {
-	int ret;
-
-	virtkvm_vfio.class = class_create("vfio");
-	if (IS_ERR(virtkvm_vfio.class))
-		return PTR_ERR(virtkvm_vfio.class);
-
-	ret = alloc_chrdev_region(&virtkvm_vfio.group_devt, 0, MINORMASK + 1, "vfio");
-	if (ret)
-		goto destroy_class;
-
-	ret = misc_register(&virtkvm_vfio_dev);
-	if (ret)
-		goto err;
-
-	/* XXX: Get table from L0 */
-	ret = virtkvm_add_ivb_cbdma();
-	if (ret)
-		pr_err("Failed to add ivybridge CBDMA device: %d", ret);
-
 	return 0;
-
-err:
-	unregister_chrdev_region(virtkvm_vfio.group_devt, MINORMASK + 1);
-destroy_class:
-	class_destroy(virtkvm_vfio.class);
-	return ret;
 }
 
 void virtkvm_vfio_cleanup(struct virtkvm_info *vi)
 {
-	misc_deregister(&virtkvm_vfio_dev);
-	unregister_chrdev_region(virtkvm_vfio.group_devt, MINORMASK + 1);
-	class_destroy(virtkvm_vfio.class);
 }
