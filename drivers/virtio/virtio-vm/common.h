@@ -6,6 +6,7 @@
 #include <linux/eventfd.h>
 #include <linux/maple_tree.h>
 #include <linux/hashtable.h>
+#include <linux/miscdevice.h>
 
 #define VIRTIO_VM_OPEN			(0)
 #define VIRTIO_VM_CLOSE			(1)
@@ -27,6 +28,10 @@
 
 #define VIRTIO_VM_IO 0xAF
 #define VIRTIO_VM_IOC_CREATE_MEMORY_FILE _IO(VIRTIO_VM_IO, 0x0)
+
+#define TACHYON_CTRL_IO 0xAE
+#define TACHYON_IOC_CREATE_PARTITION _IO(TACHYON_CTRL_IO, 0x01)
+#define TACHYON_IOC_DESTROY_PARTITION _IO(TACHYON_CTRL_IO, 0x02)
 
 #define BAR_GUEST_MEM_ALIGNMENT_ORDER PUD_SHIFT /* 1GB */
 
@@ -73,9 +78,13 @@ struct virtkvm_cmd {
 	bool free_on_done;
 };
 
+struct virtio_kvm_partition;
+
 struct virtio_kvm_eventfd {
 	struct hlist_node hnode;
 	struct eventfd_ctx *ctx;
+	u64 partition_id;
+	struct virtio_kvm_partition *part;
 	u64 handle;	/* L0 handle */
 	u32 id;		/* L1 synthetic ID */
 	refcount_t refcnt;
@@ -114,7 +123,28 @@ struct virtkvm_info {
 	struct task_struct *polling_thread;
 	wait_queue_head_t vq_wait;
 	bool vq_full;
+
+	struct list_head partitions;
+	struct mutex partition_lock;
 };
+
+struct virtio_kvm_partition {
+	u64 partition_id;
+	char name[32];
+	char nodename[64];
+	struct miscdevice misc_dev;
+	struct list_head link;
+	struct virtkvm_info *vi;
+	atomic_t refcnt;
+};
+
+void virtkvm_partition_get(struct virtio_kvm_partition *part);
+void virtkvm_partition_put(struct virtio_kvm_partition *part);
+struct virtio_kvm_partition *virtkvm_partition_get_by_id(struct virtkvm_info *vi, u64 partition_id);
+
+int virtkvm_partition_create(struct virtkvm_info *vi, u64 partition_id);
+int virtkvm_partition_destroy(struct virtkvm_info *vi, u64 partition_id);
+void virtkvm_partitions_cleanup(struct virtkvm_info *vi);
 
 extern struct virtkvm_info *vi_device;
 
@@ -127,24 +157,25 @@ enum virtio_command_mode {
 	COMMAND_ASYNC = 2,
 };
 
-long __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle, unsigned int operation, unsigned int oparg,
-			unsigned long longarg, u64 *data_out,
-			enum virtio_command_mode mode);
+long __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle,
+			       unsigned int operation, u64 oparg,
+			       unsigned long longarg, u64 *data_out,
+			       enum virtio_command_mode mode);
 int virtio_kvm_send_command(u64 handle, unsigned int operation,
-			    unsigned int oparg, unsigned long longarg,
+			    u64 oparg, unsigned long longarg,
 			    u64 *data_out);
 int virtio_kvm_send_command_async(u64 handle, unsigned int operation,
-			    unsigned int oparg, unsigned long longarg,
-			    u64 *data_out);
+				  u64 oparg, unsigned long longarg,
+				  u64 *data_out);
 int virtio_kvm_send_command_ucopy(u64 handle, unsigned int operation,
-			    unsigned int oparg, unsigned long longarg, size_t size,
-			    u64 *data);
+				  unsigned int ioctl, unsigned long arg, size_t size,
+				  u64 *data);
 int __virtio_kvm_send_command_ucopy(u64 handle, unsigned int operation, unsigned int ioctl,
-				unsigned long arg, size_t size, u64 *data,
-				int always_copy);
+				    unsigned long arg, size_t size, u64 *data,
+				    int always_copy);
 int virtio_kvm_send_command_ucopy_async(u64 handle, unsigned int operation,
-				    unsigned int ioctl, unsigned long arg,
-				    size_t size);
+					unsigned int ioctl, unsigned long arg,
+					size_t size);
 int virtio_kvm_generic_mmap(u64 handle, struct vm_area_struct *vma,
 			    const struct vm_operations_struct *vm_ops);
 
@@ -158,7 +189,7 @@ ssize_t virtio_kvm_file_write(u64 handle, const char __user *user_buffer,
 			      size_t size, loff_t *offset);
 long send_dev_munmap(u64 handle, unsigned long phys_offset, unsigned long size);
 
-struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx);
+struct virtio_kvm_eventfd *virtio_kvm_get_evfd(u64 partition_id, struct eventfd_ctx *ctx);
 void virtio_kvm_put_evfd(struct virtio_kvm_eventfd *evfd);
 
 #endif /* __VIRTIO_VM_COMMON_H */

@@ -259,7 +259,7 @@ static int vfio_translate_eventfds(struct virtkvm_vfio_device *device,
 			break;
 		}
 
-		evfd = virtio_kvm_get_evfd(eventfd);
+		evfd = virtio_kvm_get_evfd(0, eventfd);
 		if (IS_ERR(evfd)) {
 			eventfd_ctx_put(eventfd);
 			ret = PTR_ERR(evfd);

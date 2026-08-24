@@ -189,9 +189,10 @@ static void kvm_requestq_done(struct virtqueue *vq)
 }
 
 long
-__virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle, unsigned int operation, unsigned int oparg,
-			unsigned long longarg, u64 *data_out,
-			enum virtio_command_mode mode)
+__virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle,
+			  unsigned int operation, u64 oparg,
+			  unsigned long longarg, u64 *data_out,
+			  enum virtio_command_mode mode)
 {
 	struct virtio_kvm_resp *resp;
 	struct virtio_kvm_req *req;
@@ -202,7 +203,7 @@ __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle, unsigned int oper
 	int ret;
 	int i;
 
-	pr_debug("virtio_kvm_send_command: h:%llx, o:%x, oa:%x, la:%lx\n",
+	pr_debug("virtio-kvm: send_command: h:%llx, o:%x, oa:%llx, la:%lx\n",
 		 handle, operation, oparg, longarg);
 
 	init_completion(&cmd->acked);
@@ -250,8 +251,7 @@ __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle, unsigned int oper
 			if (wait_for_completion_timeout(&cmd->acked,
 							msecs_to_jiffies(250)))
 				break;
-			pr_err("virtio-kvm: slow command (%d): "
-			       "h:%llx, o:%x, oa:%x, la:%lx\n",
+			pr_err("virtio-kvm: slow command (%d): h:%llx, o:%x, oa:%llx, la:%lx\n",
 			       i, handle, operation, oparg, longarg);
 		}
 		break;
@@ -290,7 +290,7 @@ __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle, unsigned int oper
 }
 
 int virtio_kvm_send_command(u64 handle, unsigned int operation,
-			    unsigned int oparg, unsigned long longarg,
+			    u64 oparg, unsigned long longarg,
 			    u64 *data_out)
 {
 	struct virtkvm_cmd *cmd;
@@ -307,7 +307,7 @@ int virtio_kvm_send_command(u64 handle, unsigned int operation,
 }
 
 int virtio_kvm_send_command_async(u64 handle, unsigned int operation,
-				  unsigned int oparg,
+				  u64 oparg,
 				  unsigned long longarg,
 				  u64 *data_out)
 {
@@ -363,7 +363,7 @@ virtio_kvm_send_command_ucopy(u64 handle, unsigned int operation, unsigned int i
 			      unsigned long arg, size_t size, u64 *data)
 {
 	return __virtio_kvm_send_command_ucopy(handle, operation, ioctl, arg,
-					       size, data, 0);
+					       size, data, false);
 }
 
 int
@@ -664,6 +664,7 @@ static void virtio_kvm_evfd_rcu_free(struct rcu_head *rcu)
 {
 	struct virtio_kvm_eventfd *evfd = container_of(rcu, struct virtio_kvm_eventfd, rcu);
 
+	virtkvm_partition_put(evfd->part);
 	eventfd_ctx_put(evfd->ctx);
 	kfree(evfd);
 }
@@ -673,7 +674,7 @@ static void virtio_kvm_evfd_rcu_free(struct rcu_head *rcu)
  * On success, this function consumes the caller's reference to ctx.
  * On error, the caller is responsible for calling eventfd_ctx_put(ctx).
  */
-struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx)
+struct virtio_kvm_eventfd *virtio_kvm_get_evfd(u64 partition_id, struct eventfd_ctx *ctx)
 {
 	struct virtio_kvm_eventfd *evfd = NULL, *new_evfd = NULL;
 	u64 handle = -1ULL;
@@ -681,7 +682,7 @@ struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx)
 
 	spin_lock(&vi_device->evfd_lock);
 	hash_for_each_possible(vi_device->evfd_hash, evfd, hnode, (unsigned long)ctx) {
-		if (evfd->ctx != ctx)
+		if (evfd->ctx != ctx || evfd->partition_id != partition_id)
 			continue;
 
 		if (!refcount_inc_not_zero(&evfd->refcnt))
@@ -704,11 +705,14 @@ struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx)
 
 	new_evfd->id = id;
 	new_evfd->ctx = ctx;
+	new_evfd->partition_id = partition_id;
+	new_evfd->part = virtkvm_partition_get_by_id(vi_device, partition_id);
 	refcount_set(&new_evfd->refcnt, 1);
 
-	ret = virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_GET, 0,
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_GET, partition_id,
 				      (u64) id, &handle);
 	if (ret) {
+		virtkvm_partition_put(new_evfd->part);
 		ida_free(&vi_device->evfd_ida, id);
 		kfree(new_evfd);
 		return ERR_PTR(ret);
@@ -717,8 +721,9 @@ struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx)
 
 	ret = xa_insert(&vi_device->ioeventfds, handle, new_evfd, GFP_KERNEL);
 	if (ret) {
-		virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_PUT, 0,
+		virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_PUT, partition_id,
 					handle, NULL);
+		virtkvm_partition_put(new_evfd->part);
 		ida_free(&vi_device->evfd_ida, id);
 		kfree(new_evfd);
 		return ERR_PTR(ret);
@@ -727,7 +732,7 @@ struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx)
 	/* Check again if it was already added. */
 	spin_lock(&vi_device->evfd_lock);
 	hash_for_each_possible(vi_device->evfd_hash, evfd, hnode, (unsigned long)ctx) {
-		if (evfd->ctx != ctx)
+		if (evfd->ctx != ctx || evfd->partition_id != partition_id)
 			continue;
 		/* It is already here */
 		if (!refcount_inc_not_zero(&evfd->refcnt))
@@ -735,7 +740,7 @@ struct virtio_kvm_eventfd *virtio_kvm_get_evfd(struct eventfd_ctx *ctx)
 		spin_unlock(&vi_device->evfd_lock);
 
 		xa_erase(&vi_device->ioeventfds, handle);
-		virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_PUT, 0,
+		virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_PUT, partition_id,
 					handle, NULL);
 		ida_free(&vi_device->evfd_ida, id);
 		call_rcu(&new_evfd->rcu, virtio_kvm_evfd_rcu_free);
@@ -763,11 +768,163 @@ void virtio_kvm_put_evfd(struct virtio_kvm_eventfd *evfd)
 	xa_erase(&vi_device->ioeventfds, evfd->handle);
 	spin_unlock(&vi_device->evfd_lock);
 
-	virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_PUT, 0,
+	virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_PUT, evfd->partition_id,
 				evfd->handle, NULL);
 	ida_free(&vi_device->evfd_ida, evfd->id);
 	call_rcu(&evfd->rcu, virtio_kvm_evfd_rcu_free);
 }
+
+void virtkvm_partition_get(struct virtio_kvm_partition *part)
+{
+	if (part)
+		atomic_inc(&part->refcnt);
+}
+
+void virtkvm_partition_put(struct virtio_kvm_partition *part)
+{
+	if (part)
+		atomic_dec(&part->refcnt);
+}
+
+struct virtio_kvm_partition *virtkvm_partition_get_by_id(struct virtkvm_info *vi, u64 partition_id)
+{
+	struct virtio_kvm_partition *part;
+
+	if (!vi)
+		return NULL;
+
+	guard(mutex)(&vi->partition_lock);
+	list_for_each_entry(part, &vi->partitions, link) {
+		if (part->partition_id == partition_id) {
+			virtkvm_partition_get(part);
+			return part;
+		}
+	}
+	return NULL;
+}
+
+int virtkvm_partition_create(struct virtkvm_info *vi, u64 partition_id)
+{
+	struct virtio_kvm_partition *part;
+	int err;
+
+	if (!vi)
+		return -ENODEV;
+
+	mutex_lock(&vi->partition_lock);
+	list_for_each_entry(part, &vi->partitions, link) {
+		if (part->partition_id == partition_id) {
+			mutex_unlock(&vi->partition_lock);
+			return -EEXIST;
+		}
+	}
+
+	part = kzalloc(sizeof(*part), GFP_KERNEL);
+	if (!part) {
+		mutex_unlock(&vi->partition_lock);
+		return -ENOMEM;
+	}
+
+	part->partition_id = partition_id;
+	part->vi = vi;
+	atomic_set(&part->refcnt, 0);
+	INIT_LIST_HEAD(&part->link);
+
+	err = virtkvm_partition_init_kvm(part);
+	if (err) {
+		kfree(part);
+		mutex_unlock(&vi->partition_lock);
+		return err;
+	}
+
+	list_add_tail(&part->link, &vi->partitions);
+	mutex_unlock(&vi->partition_lock);
+
+	pr_info("Registered partition device /dev/%s for partition %llu\n",
+		part->nodename, partition_id);
+	return 0;
+}
+
+int virtkvm_partition_destroy(struct virtkvm_info *vi, u64 partition_id)
+{
+	struct virtio_kvm_partition *part, *tmp;
+	bool found = false;
+
+	if (!vi)
+		return -ENODEV;
+
+	mutex_lock(&vi->partition_lock);
+	list_for_each_entry_safe(part, tmp, &vi->partitions, link) {
+		if (part->partition_id == partition_id) {
+			found = true;
+			break;
+		}
+	}
+
+	if (!found) {
+		mutex_unlock(&vi->partition_lock);
+		return -ENOENT;
+	}
+
+	if (atomic_read(&part->refcnt) > 0) {
+		mutex_unlock(&vi->partition_lock);
+		return -EBUSY;
+	}
+
+	list_del_init(&part->link);
+	mutex_unlock(&vi->partition_lock);
+
+	virtkvm_partition_cleanup_kvm(part);
+	pr_info("Deregistered partition device /dev/%s for partition %llu\n",
+		part->nodename, partition_id);
+	kfree(part);
+	return 0;
+}
+
+void virtkvm_partitions_cleanup(struct virtkvm_info *vi)
+{
+	struct virtio_kvm_partition *part, *tmp;
+
+	if (!vi)
+		return;
+
+	mutex_lock(&vi->partition_lock);
+	list_for_each_entry_safe(part, tmp, &vi->partitions, link) {
+		list_del(&part->link);
+		virtkvm_partition_cleanup_kvm(part);
+		kfree(part);
+	}
+	mutex_unlock(&vi->partition_lock);
+}
+
+static long
+tachyon_ctrl_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+{
+	switch (ioctl) {
+	case TACHYON_IOC_CREATE_PARTITION:
+		return virtkvm_partition_create(vi_device, arg);
+
+	case TACHYON_IOC_DESTROY_PARTITION:
+		return virtkvm_partition_destroy(vi_device, arg);
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations tachyon_ctrl_fops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = tachyon_ctrl_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
+	.open = simple_open,
+	.llseek = noop_llseek,
+};
+
+static struct miscdevice tachyon_ctrl_dev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "tachyon-ctrl",
+	.fops = &tachyon_ctrl_fops,
+};
 
 static int virtio_vm_init(struct virtio_device *vdev)
 {
@@ -812,18 +969,28 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	INIT_WORK(&vi->poll_refill, refill_work);
 	spin_lock_init(&vi->virtkvm_lock);
 
+	INIT_LIST_HEAD(&vi->partitions);
+	mutex_init(&vi->partition_lock);
+
 	err = -ENOMEM;
 	eventfd_cleanup_wq = alloc_workqueue("virtio-kvm-eventfd-cleanup", 0, 0);
 	if (!eventfd_cleanup_wq)
-		return err;
+		goto err;
 
-	err = virtkvm_kvm_init(vi);
+	err = misc_register(&tachyon_ctrl_dev);
 	if (err)
 		goto err;
+
+	err = virtkvm_kvm_init(vi);
+	if (err) {
+		misc_deregister(&tachyon_ctrl_dev);
+		goto err;
+	}
 
 	err = virtkvm_vfio_init(vi);
 	if (err) {
 		virtkvm_kvm_cleanup(vi);
+		misc_deregister(&tachyon_ctrl_dev);
 		goto err;
 	}
 
@@ -833,6 +1000,7 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	return 0;
 
 err:
+	virtkvm_partitions_cleanup(vi);
 	if (eventfd_cleanup_wq)
 		destroy_workqueue(eventfd_cleanup_wq);
 	mtree_destroy(&vi->allocinfo.mt);
@@ -868,6 +1036,10 @@ static int virtkvm_probe(struct virtio_device *vdev)
 
 static void virtkvm_remove(struct virtio_device *vdev)
 {
+	misc_deregister(&tachyon_ctrl_dev);
+
+	virtkvm_partitions_cleanup(vi_device);
+
 	virtkvm_vfio_cleanup(vi_device);
 
 	virtkvm_kvm_cleanup(vi_device);

@@ -39,8 +39,13 @@ struct virtio_kvm_irqfd {
 	u64 resamplefd_handle;
 };
 
+struct virtio_kvm_partition;
+
 int virtkvm_kvm_init(struct virtkvm_info *vi);
 void virtkvm_kvm_cleanup(struct virtkvm_info *vi);
 void virtio_kvm_eventfd_poll_done(struct virtio_kvm_poll *poll);
+
+int virtkvm_partition_init_kvm(struct virtio_kvm_partition *part);
+void virtkvm_partition_cleanup_kvm(struct virtio_kvm_partition *part);
 
 #endif /* __VIRTIO_KVM_H */

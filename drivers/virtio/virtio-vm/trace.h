@@ -143,14 +143,14 @@ TRACE_EVENT(virtio_vm_ioeventfd_signal,
 
 TRACE_EVENT(virtio_vm_vq_add,
 
-	TP_PROTO(u64 handle, unsigned int operation, unsigned int oparg, unsigned long longarg),
+	TP_PROTO(u64 handle, unsigned int operation, u64 oparg, unsigned long longarg),
 
 	TP_ARGS(handle, operation, oparg, longarg),
 
 	TP_STRUCT__entry(
 		__field(u64, handle)
 		__field(unsigned int, operation)
-		__field(unsigned int, oparg)
+		__field(u64, oparg)
 		__field(unsigned long, longarg)
 	),
 
@@ -161,20 +161,20 @@ TRACE_EVENT(virtio_vm_vq_add,
 		__entry->longarg = longarg;
 	),
 
-	TP_printk("handle=%llx operation=%u oparg=%u longarg=%lx",
+	TP_printk("handle=%llx operation=%u oparg=%llu longarg=%lx",
 		  __entry->handle, __entry->operation, __entry->oparg, __entry->longarg)
 );
 
 TRACE_EVENT(virtio_vm_vq_remove,
 
-	TP_PROTO(u64 handle, unsigned int operation, unsigned int oparg, unsigned long longarg, int status),
+	TP_PROTO(u64 handle, unsigned int operation, u64 oparg, unsigned long longarg, int status),
 
 	TP_ARGS(handle, operation, oparg, longarg, status),
 
 	TP_STRUCT__entry(
 		__field(u64, handle)
 		__field(unsigned int, operation)
-		__field(unsigned int, oparg)
+		__field(u64, oparg)
 		__field(unsigned long, longarg)
 		__field(int, status)
 	),
@@ -187,7 +187,7 @@ TRACE_EVENT(virtio_vm_vq_remove,
 		__entry->status = status;
 	),
 
-	TP_printk("handle=%llx operation=%u oparg=%u longarg=%lx status=%d",
+	TP_printk("handle=%llx operation=%u oparg=%llu longarg=%lx status=%d",
 		  __entry->handle, __entry->operation, __entry->oparg, __entry->longarg, __entry->status)
 );
 

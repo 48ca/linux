@@ -28,6 +28,12 @@
 #undef pr_fmt
 #define pr_fmt(fmt) "virtio-vm: kvm: " fmt
 
+struct virtio_kvm_dev_ctx {
+	u64 handle;
+	u64 partition_id;
+	struct virtio_kvm_partition *part;
+};
+
 struct virtio_kvm_mem_region {
 	struct list_head link;
 	int slot;
@@ -36,6 +42,8 @@ struct virtio_kvm_mem_region {
 
 struct virtio_kvm_vm {
 	u64 handle;
+	u64 partition_id;
+	struct virtio_kvm_partition *part;
 	struct mutex region_lock;
 	struct list_head memory_regions;
 
@@ -316,14 +324,41 @@ out:
 static int
 virtio_kvm_open(struct inode *inode, struct file *filp)
 {
-	u64 data;
+	struct miscdevice *misc = filp->private_data;
+	struct virtio_kvm_partition *part;
+	struct virtio_kvm_dev_ctx *ctx;
+	u64 partition_id, data;
 	int ret;
 
-	ret = virtio_kvm_send_command(-1, VIRTIO_VM_OPEN, 0, 0, &data);
-	if (ret)
-		return ret;
+	part = container_of(misc, struct virtio_kvm_partition, misc_dev);
+	partition_id = part->partition_id;
 
-	filp->private_data = (void *)data;
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	if (part->vi) {
+		mutex_lock(&part->vi->partition_lock);
+		if (list_empty(&part->link)) {
+			mutex_unlock(&part->vi->partition_lock);
+			kfree(ctx);
+			return -ENODEV;
+		}
+		virtkvm_partition_get(part);
+		mutex_unlock(&part->vi->partition_lock);
+	}
+
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_OPEN, partition_id, 0, &data);
+	if (ret) {
+		virtkvm_partition_put(part);
+		kfree(ctx);
+		return ret;
+	}
+
+	ctx->handle = data;
+	ctx->partition_id = partition_id;
+	ctx->part = part;
+	filp->private_data = ctx;
 
 	return 0;
 }
@@ -331,12 +366,18 @@ virtio_kvm_open(struct inode *inode, struct file *filp)
 static int
 virtio_kvm_release(struct inode *inode, struct file *filp)
 {
-	u64 handle = (u64)filp->private_data;
-	int ret;
+	struct virtio_kvm_dev_ctx *ctx = filp->private_data;
+	int ret = 0;
 
-	ret = virtio_kvm_send_command_async(handle, VIRTIO_VM_CLOSE,
-					    0, 0, NULL);
-	WARN_ONCE(ret, "Failed to start releasing vm %llx: %d\n", handle, ret);
+	if (ctx) {
+		u64 handle = ctx->handle;
+
+		ret = virtio_kvm_send_command_async(handle, VIRTIO_VM_CLOSE,
+						    0, 0, NULL);
+		WARN_ONCE(ret, "Failed to start releasing kvm dev %llx: %d\n", handle, ret);
+		virtkvm_partition_put(ctx->part);
+		kfree(ctx);
+	}
 
 	return ret;
 }
@@ -1201,7 +1242,7 @@ virtio_kvm_irqfd_link_assign(struct virtio_kvm_vm *vm, struct kvm_irqfd *args)
 		goto err;
 	}
 
-	evfd = virtio_kvm_get_evfd(eventfd);
+	evfd = virtio_kvm_get_evfd(vm->partition_id, eventfd);
 	if (IS_ERR(evfd)) {
 		eventfd_ctx_put(eventfd);
 		ret = PTR_ERR(evfd);
@@ -1220,7 +1261,7 @@ virtio_kvm_irqfd_link_assign(struct virtio_kvm_vm *vm, struct kvm_irqfd *args)
 			ret = PTR_ERR(resample_eventfd);
 			goto err;
 		}
-		resample_evfd = virtio_kvm_get_evfd(resample_eventfd);
+		resample_evfd = virtio_kvm_get_evfd(vm->partition_id, resample_eventfd);
 		if (IS_ERR(resample_evfd)) {
 			eventfd_ctx_put(resample_eventfd);
 			ret = PTR_ERR(resample_evfd);
@@ -1621,7 +1662,7 @@ virtio_kvm_ioeventfd_assign(struct virtio_kvm_vm *vm,
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
-	evfd = virtio_kvm_get_evfd(ctx);
+	evfd = virtio_kvm_get_evfd(vm->partition_id, ctx);
 	if (IS_ERR(evfd)) {
 		eventfd_ctx_put(ctx);
 		return PTR_ERR(evfd);
@@ -1937,6 +1978,7 @@ virtio_kvm_vm_release(struct inode *inode, struct file *filp)
 	ret = virtio_kvm_send_command_async(handle, VIRTIO_VM_CLOSE, 0, 0, NULL);
 	WARN_ON_ONCE(ret);
 
+	virtkvm_partition_put(vm->part);
 	kfree(vm);
 
 	return ret;
@@ -1994,9 +2036,13 @@ static int virtio_kvm_vm_setup_shm(struct virtio_kvm_vm *vm)
 }
 
 static void
-init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp)
+init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp,
+	struct virtio_kvm_partition *part, u64 partition_id)
 {
 	vm->handle = handle;
+	vm->partition_id = partition_id;
+	vm->part = part;
+	virtkvm_partition_get(part);
 	INIT_LIST_HEAD(&vm->memory_regions);
 	mutex_init(&vm->region_lock);
 	INIT_LIST_HEAD(&vm->irqfds);
@@ -2009,7 +2055,10 @@ init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp)
 static long
 virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
-	u64 handle = (u64) filp->private_data;
+	struct virtio_kvm_dev_ctx *ctx = filp->private_data;
+	u64 handle = ctx ? ctx->handle : 0;
+	u64 partition_id = ctx ? ctx->partition_id : 0;
+	struct virtio_kvm_partition *part = ctx ? ctx->part : NULL;
 	struct virtio_kvm_vm *vm;
 	struct file *file;
 	u64 data;
@@ -2031,7 +2080,7 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 
 	switch (ioctl) {
 	case VIRTIO_VM_IOC_CREATE_MEMORY_FILE:
-		err = virtio_kvm_create_memory_anonfile(arg);
+		err = virtio_kvm_create_memory_anonfile(arg, partition_id);
 		break;
 	CASE_KVM_IOCTL_BASIC(KVM_GET_VCPU_MMAP_SIZE);
 	CASE_KVM_IOCTL_BASIC(KVM_GET_API_VERSION);
@@ -2044,14 +2093,15 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		err = virtio_kvm_handle_device_attr(handle, ioctl, arg, &data);
 		break;
 	case KVM_CREATE_VM:
-		vm = (struct virtio_kvm_vm *)kmalloc(sizeof(*vm), GFP_KERNEL);
+		vm = kzalloc(sizeof(*vm), GFP_KERNEL);
 		if (!vm)
 			return -ENOMEM;
 		err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL,
 					      ioctl, arg, &data);
-		if (err)
+		if (err) {
 			kfree(vm);
-
+			break;
+		}
 		break;
 	case KVM_GET_SUPPORTED_CPUID:
 		err = virtio_kvm_handle_cpuid(handle, ioctl, arg, &data);
@@ -2090,7 +2140,7 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 			kfree(vm);
 			return PTR_ERR(file);
 		}
-		init_vm(vm, data, file);
+		init_vm(vm, data, file, part, partition_id);
 		err = virtio_kvm_vm_setup_shm(vm);
 		if (err) {
 			fput(file);
@@ -2181,11 +2231,23 @@ static const struct file_operations virtio_kvm_dev_ops = {
 	.release = virtio_kvm_release
 };
 
-struct miscdevice kvm_dev = {
-	KVM_MINOR,
-	"kvm",
-	&virtio_kvm_dev_ops,
-};
+int virtkvm_partition_init_kvm(struct virtio_kvm_partition *part)
+{
+	snprintf(part->name, sizeof(part->name), "tachyon-%llu-kvm", part->partition_id);
+	snprintf(part->nodename, sizeof(part->nodename), "tachyon-%llu/kvm", part->partition_id);
+	part->misc_dev.minor = MISC_DYNAMIC_MINOR;
+	part->misc_dev.name = part->name;
+	part->misc_dev.nodename = part->nodename;
+	part->misc_dev.mode = 0666;
+	part->misc_dev.fops = &virtio_kvm_dev_ops;
+
+	return misc_register(&part->misc_dev);
+}
+
+void virtkvm_partition_cleanup_kvm(struct virtio_kvm_partition *part)
+{
+	misc_deregister(&part->misc_dev);
+}
 
 int virtkvm_kvm_init(struct virtkvm_info *vi) {
 	int err;
@@ -2201,12 +2263,10 @@ int virtkvm_kvm_init(struct virtkvm_info *vi) {
 		return err;
 	}
 
-	return misc_register(&kvm_dev);
+	return 0;
 }
 
 void virtkvm_kvm_cleanup(struct virtkvm_info *vi) {
-	misc_deregister(&kvm_dev);
-
 	if (vi->polling_thread)
 		kthread_stop(vi->polling_thread);
 }

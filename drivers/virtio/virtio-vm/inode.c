@@ -18,21 +18,24 @@
 #include <linux/seq_file.h>
 
 #include "common.h"
+#include "kvm.h"
 #include "inode.h"
 #include "trace.h"
 
 struct vkvmfs_mount_opts {
-	u32 partition;
+	u64 partition;
 };
 
 struct vkvmfs_fs_info {
 	struct vkvmfs_mount_opts mount_opts;
+	struct virtio_kvm_partition *part;
 };
 
 struct kvm_guest_memory_file {
 	u64 handle;
 	unsigned long pfn;
 	unsigned long size;
+	struct virtio_kvm_partition *part;
 };
 
 #define VKVMFS_DEFAULT_MODE	0755
@@ -136,7 +139,7 @@ static int virtio_kvm_init_memory_file_pdata(void **private_data)
 }
 
 static int virtio_kvm_create_memory_file(struct kvm_guest_memory_file *gfile,
-				  unsigned long size)
+				  unsigned long size, u64 partition_id)
 {
 	u64 phys_offset;
 	int err;
@@ -165,7 +168,7 @@ static int virtio_kvm_create_memory_file(struct kvm_guest_memory_file *gfile,
 	h->size = size;
 	h->phys_offset = phys_offset;
 
-	err = virtio_kvm_send_command(-1, VIRTIO_VM_MEMORY_FILE_CREATE, 0,
+	err = virtio_kvm_send_command(-1, VIRTIO_VM_MEMORY_FILE_CREATE, partition_id,
 				      __pa(h), NULL);
 	if (err) {
 		virtio_vm_put_unused_phys_offset(phys_offset, size);
@@ -176,6 +179,7 @@ static int virtio_kvm_create_memory_file(struct kvm_guest_memory_file *gfile,
 	gfile->size = h->size;
 	gfile->pfn = (phys_offset + vi_device->phys_start) >> PAGE_SHIFT;
 	gfile->handle = h->handle;
+	gfile->part = virtkvm_partition_get_by_id(vi_device, partition_id);
 
 	pr_debug("guest memory file placed at %lx\n", gfile->pfn);
 
@@ -203,6 +207,7 @@ virtio_kvm_memory_file_release(struct inode *inode, struct file *filp)
 				gfile->handle, err);
 	}
 
+	virtkvm_partition_put(gfile->part);
 	kfree(gfile);
 	return err;
 }
@@ -213,7 +218,8 @@ const struct file_operations kvm_memory_anonfile_fops = {
 	.mmap = virtio_kvm_memory_file_mmap,
 };
 
-int virtio_kvm_create_memory_anonfile(unsigned long size) {
+int virtio_kvm_create_memory_anonfile(unsigned long size, u64 partition_id)
+{
 	struct file *file;
 	int fd, ret;
 
@@ -236,7 +242,7 @@ int virtio_kvm_create_memory_anonfile(unsigned long size) {
 		goto err;
 	ret = virtio_kvm_create_memory_file(
 			(struct kvm_guest_memory_file *)file->private_data,
-			size);
+			size, partition_id);
 	if (ret)
 		goto err;
 
@@ -262,6 +268,7 @@ static int vkvmfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return error;
 
 	if (ia_valid & ATTR_SIZE) {
+		struct vkvmfs_fs_info *fsi = dentry->d_sb->s_fs_info;
 		struct kvm_guest_memory_file *gfile;
 		loff_t oldsize = inode->i_size;
 		loff_t newsize = attr->ia_size;
@@ -275,7 +282,8 @@ static int vkvmfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		if (!newsize)
 			goto out;
 
-		error = virtio_kvm_create_memory_file(gfile, newsize);
+		error = virtio_kvm_create_memory_file(gfile, newsize,
+						      fsi->mount_opts.partition);
 		if (error)
 			return error;
 
@@ -390,7 +398,7 @@ static int vkvmfs_show_options(struct seq_file *m, struct dentry *root)
 {
 	struct vkvmfs_fs_info *fsi = root->d_sb->s_fs_info;
 
-	seq_printf(m, ",partition=%u", fsi->mount_opts.partition);
+	seq_printf(m, ",partition=%llu", fsi->mount_opts.partition);
 	return 0;
 }
 
@@ -411,6 +419,7 @@ static void vkvmfs_evict_inode(struct inode *inode)
 			gfile->size = 0;
 		}
 
+		virtkvm_partition_put(gfile->part);
 		kfree(gfile);
 	}
 }
@@ -427,7 +436,7 @@ enum vkvmfs_param {
 };
 
 const struct fs_parameter_spec vkvmfs_fs_parameters[] = {
-	fsparam_u32oct("partition",	Opt_partition),
+	fsparam_u64("partition",	Opt_partition),
 	{}
 };
 
@@ -451,7 +460,7 @@ static int vkvmfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 
 	switch (opt) {
 	case Opt_partition:
-		fsi->mount_opts.partition = result.uint_32;
+		fsi->mount_opts.partition = result.uint_64;
 		break;
 	}
 
@@ -460,6 +469,7 @@ static int vkvmfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 
 static int vkvmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
+	struct vkvmfs_fs_info *fsi = sb->s_fs_info;
 	struct inode *inode;
 
 	sb->s_maxbytes		= MAX_LFS_FILESIZE;
@@ -469,10 +479,14 @@ static int vkvmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_op		= &vkvmfs_ops;
 	sb->s_time_gran		= 1;
 
+	fsi->part = virtkvm_partition_get_by_id(vi_device, fsi->mount_opts.partition);
+
 	inode = vkvmfs_get_inode(&nop_mnt_idmap, sb, NULL, S_IFDIR | VKVMFS_DEFAULT_MODE, 0);
 	sb->s_root = d_make_root(inode);
-	if (!sb->s_root)
+	if (!sb->s_root) {
+		virtkvm_partition_put(fsi->part);
 		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -509,8 +523,12 @@ static int vkvmfs_init_fs_context(struct fs_context *fc)
 
 static void vkvmfs_kill_sb(struct super_block *sb)
 {
-	kfree(sb->s_fs_info);
+	struct vkvmfs_fs_info *fsi = sb->s_fs_info;
+
+	if (fsi)
+		virtkvm_partition_put(fsi->part);
 	kill_anon_super(sb);
+	kfree(fsi);
 }
 
 static struct file_system_type vkvmfs_fs_type = {
