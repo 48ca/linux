@@ -403,10 +403,6 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd, unsig
 	int ret = -EOPNOTSUPP;
 
 	switch (cmd) {
-	case VFIO_DEVICE_RESET: {
-		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, 0, NULL);
-		break;
-	}
 	case VFIO_DEVICE_GET_INFO: {
 		struct vfio_device_info __user *udev = u64_to_user_ptr((u64)arg);
 		struct vfio_device_info *dev;
