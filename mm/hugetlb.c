@@ -3325,6 +3325,17 @@ static void __init prep_and_add_bootmem_folios(struct hstate *h,
 	unsigned long flags;
 	struct folio *folio, *tmp_f;
 
+	/*
+	 * Bootmem folios are normally pre-HVOed through the section-based
+	 * vmemmap optimization. However, an architecture that can only
+	 * determine whether it supports HVO after bootmem allocation disables
+	 * the section-based optimization (see
+	 * section_vmemmap_optimization_disable()), in which case the folios
+	 * were not pre-HVOed and must be optimized now. Pre-HVOed folios are
+	 * skipped.
+	 */
+	hugetlb_vmemmap_optimize_folios(h, folio_list);
+
 	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
 		/* Subdivide locks to achieve better parallel performance */
 		spin_lock_irqsave(&hugetlb_lock, flags);
