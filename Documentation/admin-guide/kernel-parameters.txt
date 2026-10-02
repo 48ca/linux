@@ -1694,6 +1694,7 @@ Kernel parameters
 	fail_usercopy=
 	fail_page_alloc=
 	fail_skb_realloc=
+	fail_hugetlb_vmemmap_pte=
 	fail_make_request=[KNL]
 			General fault injection mechanism.
 			Format: <interval>,<probability>,<space>,<times>
