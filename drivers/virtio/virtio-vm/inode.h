@@ -12,4 +12,7 @@ bool virtio_kvm_is_vkvmfs(struct file *filp);
 
 int vkvmfs_offset_to_pa(struct file *filp, off_t offset, size_t size, unsigned long *pa);
 
+int virtkvm_inode_init(void);
+void virtkvm_inode_cleanup(void);
+
 #endif // __VIRTIO_VM_INODE_H

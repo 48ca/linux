@@ -532,14 +532,19 @@ static void vkvmfs_kill_sb(struct super_block *sb)
 }
 
 static struct file_system_type vkvmfs_fs_type = {
+	.owner		= THIS_MODULE,
 	.name		= "vkvmfs",
 	.init_fs_context = vkvmfs_init_fs_context,
 	.parameters	= vkvmfs_fs_parameters,
 	.kill_sb	= vkvmfs_kill_sb,
 };
 
-static int __init init_vkvmfs_fs(void)
+int __init virtkvm_inode_init(void)
 {
 	return register_filesystem(&vkvmfs_fs_type);
 }
-fs_initcall(init_vkvmfs_fs);
+
+void __exit virtkvm_inode_cleanup(void)
+{
+	unregister_filesystem(&vkvmfs_fs_type);
+}

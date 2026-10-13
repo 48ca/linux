@@ -1071,7 +1071,29 @@ static struct virtio_driver virtio_kvm_driver = {
 	.remove =	virtkvm_remove,
 };
 
-module_virtio_driver(virtio_kvm_driver);
+static int __init virtio_vm_mod_init(void)
+{
+	int ret;
+
+	ret = virtkvm_inode_init();
+	if (ret)
+		return ret;
+
+	ret = register_virtio_driver(&virtio_kvm_driver);
+	if (ret)
+		virtkvm_inode_cleanup();
+
+	return ret;
+}
+
+static void __exit virtio_vm_mod_exit(void)
+{
+	unregister_virtio_driver(&virtio_kvm_driver);
+	virtkvm_inode_cleanup();
+}
+
+module_init(virtio_vm_mod_init);
+module_exit(virtio_vm_mod_exit);
 MODULE_DEVICE_TABLE(virtio, id_table);
 MODULE_DESCRIPTION("Virtio KVM Driver");
 MODULE_LICENSE("GPL");
