@@ -28,6 +28,9 @@
 * kmalloc allocation failures under physical memory fragmentation.
 */
 #define VIRTKVM_VFIO_MAX_ARGSZ		(32 * 1024)
+#define VIRTKVM_VFIO_MAX_IRQS		2048
+#define VIRTKVM_VFIO_MAX_IRQ_INDEX	64
+#define VIRTKVM_VFIO_MAX_GROUPS		4096
 
 struct virtkvm_vfio_device {
 	char				address[PCI_ADDRESS_LENGTH];
@@ -37,6 +40,7 @@ struct virtkvm_vfio_device {
 	struct virtkvm_vfio_container	*container;
 	struct virtio_kvm_partition	*part;
 
+	struct mutex			irq_lock;
 	struct xarray			irq_ctx;
 };
 
@@ -52,7 +56,7 @@ struct virtkvm_vfio_group {
 	struct list_head		link;
 	struct miscdevice		misc_dev;
 	struct kref			kref;
-	char				name[32];
+	char				name[64];
 	char				nodename[64];
 	u64				group_id;
 	u64				partition_id;
@@ -146,6 +150,14 @@ virtkvm_vfio_device_mmap(struct file *filp, struct vm_area_struct *vma)
 	return virtio_kvm_generic_mmap(device->handle, vma, &vfio_device_vm_ops);
 }
 
+static inline unsigned long virtkvm_vfio_irq_xa_key(u32 index, u32 flags,
+						    u32 subindex)
+{
+	unsigned long action = (flags & VFIO_IRQ_SET_ACTION_TYPE_MASK) >> 3;
+
+	return ((unsigned long)index << 16) | (action << 12) | subindex;
+}
+
 static int virtkvm_vfio_set_irqs_get_size(struct vfio_irq_set *irqs,
 					  size_t *asize, size_t *usize)
 {
@@ -155,8 +167,15 @@ static int virtkvm_vfio_set_irqs_get_size(struct vfio_irq_set *irqs,
 	if (irqs->argsz < sizeof(*irqs))
 		return -EINVAL;
 
+	if (irqs->index >= VIRTKVM_VFIO_MAX_IRQ_INDEX)
+		return -EINVAL;
+
 	/* MSI-X supports up to 2048. Use that as the max for now. */
-	if (irqs->count > 2048)
+	if (irqs->start > VIRTKVM_VFIO_MAX_IRQS ||
+	    irqs->count > VIRTKVM_VFIO_MAX_IRQS - irqs->start)
+		return -EINVAL;
+
+	if (hweight32(irqs->flags & VFIO_IRQ_SET_ACTION_TYPE_MASK) != 1)
 		return -EINVAL;
 
 	switch (irqs->flags & VFIO_IRQ_SET_DATA_TYPE_MASK) {
@@ -283,6 +302,8 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 	int ret;
 	int i;
 
+	guard(mutex)(&device->irq_lock);
+
 	if (copy_from_user(&tmp_irqs, uirqs, sizeof(tmp_irqs)))
 		return -EFAULT;
 
@@ -309,9 +330,13 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 
 	if (evfds) {
 		for (; xa_idx < irqs->count; ++xa_idx) {
+			unsigned long key;
+
 			if (!evfds[xa_idx])
 				continue;
-			ret = xa_reserve(&device->irq_ctx, irqs->start + xa_idx, GFP_KERNEL);
+			key = virtkvm_vfio_irq_xa_key(irqs->index, irqs->flags,
+						      irqs->start + xa_idx);
+			ret = xa_reserve(&device->irq_ctx, key, GFP_KERNEL);
 			if (ret)
 				goto release;
 		}
@@ -323,16 +348,20 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 
 	ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL,
 				      VFIO_DEVICE_SET_IRQS, __pa(irqs), NULL);
-	if (WARN_ON(ret))
+	if (ret)
 		goto release;
 
 	if (!evfds) {
 		if ((irqs->flags & VFIO_IRQ_SET_ACTION_TRIGGER) &&
-		    (irqs->flags & VFIO_IRQ_SET_DATA_NONE)) {
-			for (i = 0; i < irqs->count; ++i) {
-				struct virtio_kvm_eventfd *old_evfd;
+		    (irqs->flags & VFIO_IRQ_SET_DATA_NONE) &&
+		    irqs->count == 0) {
+			struct virtio_kvm_eventfd *old_evfd;
+			unsigned long start_key = virtkvm_vfio_irq_xa_key(irqs->index, 0, 0);
+			unsigned long end_key = virtkvm_vfio_irq_xa_key(irqs->index + 1, 0, 0) - 1;
+			unsigned long idx;
 
-				old_evfd = xa_erase(&device->irq_ctx, irqs->start + i);
+			xa_for_each_range(&device->irq_ctx, idx, old_evfd, start_key, end_key) {
+				old_evfd = xa_erase(&device->irq_ctx, idx);
 				if (old_evfd)
 					virtio_kvm_put_evfd(old_evfd);
 			}
@@ -343,15 +372,17 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 
 	for (i = 0; i < irqs->count; ++i) {
 		struct virtio_kvm_eventfd *old_evfd;
+		unsigned long key = virtkvm_vfio_irq_xa_key(irqs->index, irqs->flags,
+							    irqs->start + i);
 
 		if (!evfds[i]) {
-			old_evfd = xa_erase(&device->irq_ctx, irqs->start + i);
+			old_evfd = xa_erase(&device->irq_ctx, key);
 			if (old_evfd)
 				virtio_kvm_put_evfd(old_evfd);
 			continue;
 		}
 
-		old_evfd = xa_store(&device->irq_ctx, irqs->start + i, evfds[i],
+		old_evfd = xa_store(&device->irq_ctx, key, evfds[i],
 				    GFP_KERNEL);
 		/*
 		 * xa_store is not expected to fail here because the slot was
@@ -372,8 +403,11 @@ static long virtkvm_vfio_device_set_irqs(struct virtkvm_vfio_device *device,
 release:
 	if (evfds) {
 		for (i = 0; i < xa_idx; ++i) {
-			if (evfds[i])
-				xa_release(&device->irq_ctx, irqs->start + i);
+			if (evfds[i]) {
+				unsigned long key = virtkvm_vfio_irq_xa_key(
+					irqs->index, irqs->flags, irqs->start + i);
+				xa_release(&device->irq_ctx, key);
+			}
 		}
 		virtkvm_vfio_free_eventfds(evfds, irqs->count);
 	}
@@ -412,6 +446,7 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd,
 			kfree(dev);
 			break;
 		}
+		dev->argsz = argsz;
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(dev), NULL);
 
@@ -443,6 +478,7 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd,
 			kfree(reg);
 			break;
 		}
+		reg->argsz = argsz;
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(reg), NULL);
 
@@ -474,6 +510,7 @@ static long virtkvm_vfio_device_ioctl(struct file *filp, unsigned int cmd,
 			kfree(irq);
 			break;
 		}
+		irq->argsz = argsz;
 
 		ret = virtio_kvm_send_command(device->handle, VIRTIO_VM_IOCTL, cmd, __pa(irq), NULL);
 
@@ -675,22 +712,25 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 
 		memcpy(device->address, dev_name, PCI_ADDRESS_LENGTH);
 
-		filep = anon_inode_getfile_fmode("[virtkvm-vfio-device]", &virtkvm_vfio_device_fops,
-				device, O_RDWR, FMODE_PREAD | FMODE_PWRITE);
-		if (IS_ERR(filep)) {
+		ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL,
+					      VFIO_GROUP_GET_DEVICE_FD,
+					      __pa(device->address),
+					      &data);
+		if (ret) {
 			kfree(device);
 			put_unused_fd(fdno);
-			ret = PTR_ERR(filep);
 			break;
 		}
 
-		ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL,
-						VFIO_GROUP_GET_DEVICE_FD,
-						__pa(device->address),
-						&data);
-		if (ret) {
-			fput(filep);
+		filep = anon_inode_getfile_fmode("[virtkvm-vfio-device]",
+						 &virtkvm_vfio_device_fops,
+						 device, O_RDWR,
+						 FMODE_PREAD | FMODE_PWRITE);
+		if (IS_ERR(filep)) {
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
+			kfree(device);
 			put_unused_fd(fdno);
+			ret = PTR_ERR(filep);
 			break;
 		}
 
@@ -704,6 +744,7 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 		kref_get(&group->kref);
 		kref_get(&container->kref);
 		group->device_fd_count++;
+		mutex_init(&device->irq_lock);
 		xa_init(&device->irq_ctx);
 
 		fd_install(fdno, filep);
@@ -733,6 +774,7 @@ static long virtkvm_vfio_group_ioctl(struct file *filp, unsigned int cmd, unsign
 			kfree(g);
 			break;
 		}
+		g->argsz = argsz;
 
 		ret = virtio_kvm_send_command(group->handle, VIRTIO_VM_IOCTL, cmd,
 						__pa(g), NULL);
@@ -875,6 +917,7 @@ static long virtkvm_vfio_ioctl(struct file *filp, unsigned int cmd,
 			kfree(info);
 			break;
 		}
+		info->argsz = argsz;
 
 		ret = virtio_kvm_send_command(container->handle,
 						VIRTIO_VM_IOCTL, cmd,
@@ -1003,7 +1046,7 @@ int virtkvm_partition_init_vfio(struct virtio_kvm_partition *part)
 		return 0;
 	}
 
-	if (num_groups == 0)
+	if (num_groups == 0 || num_groups > VIRTKVM_VFIO_MAX_GROUPS)
 		return 0;
 
 	groups = kmalloc_array(num_groups, sizeof(u64), GFP_KERNEL);
