@@ -62,6 +62,7 @@ struct virtio_kvm_vcpu {
 	u64 handle;
 	struct virtio_kvm_vm *vm;
 	u32 vcpu_id;
+	struct mutex mutex;
 	struct list_head active_link;
 	wait_queue_head_t wait;
 	bool completed;
@@ -98,36 +99,80 @@ static int virtio_kvm_ioeventfd_deassign(struct virtio_kvm_vm *vm,
 static int poll_idle_timeout_us = 1000;
 module_param(poll_idle_timeout_us, int, 0644);
 
+#define VIRTKVM_MAX_MSR_ENTRIES		4096
+#define VIRTKVM_MAX_CPUID_ENTRIES	2048
+#define VIRTKVM_MAX_NESTED_STATE_SIZE	(64 * 1024)
+#define VIRTKVM_MAX_PMU_EVENTS		4096
+#define VIRTKVM_MAX_IRQ_ROUTES		4096
+
 static int
 virtio_kvm_handle_msr_list(u64 handle, unsigned int ioctl, unsigned long arg, u64 *data)
 {
-	struct kvm_msr_list *__user msr_list = u64_to_user_ptr((u64)arg);
+	struct kvm_msr_list __user *msr_list = u64_to_user_ptr((u64)arg);
+	struct kvm_msr_list *klist;
 	size_t size;
 	u32 nmsrs;
+	int err;
 
 	if (get_user(nmsrs, &msr_list->nmsrs))
 		return -EFAULT;
 
-	size = offsetof(struct kvm_msr_list, indices) +
-	       nmsrs * sizeof(__u32);
-	return __virtio_kvm_send_command_ucopy(handle, VIRTIO_VM_IOCTL,
-					     ioctl, arg, size, data, 1);
+	if (nmsrs > VIRTKVM_MAX_MSR_ENTRIES)
+		return -E2BIG;
+
+	size = struct_size(klist, indices, nmsrs);
+	klist = kzalloc(size, GFP_KERNEL);
+	if (!klist)
+		return -ENOMEM;
+
+	if (copy_from_user(klist, msr_list, size)) {
+		kfree(klist);
+		return -EFAULT;
+	}
+	klist->nmsrs = nmsrs;
+
+	err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL, ioctl,
+				      __pa(klist), data);
+	if (copy_to_user(msr_list, klist, size))
+		err = -EFAULT;
+
+	kfree(klist);
+	return err;
 }
 
 static int
 virtio_kvm_handle_msrs(u64 handle, unsigned int ioctl, unsigned long arg, u64 *data)
 {
-	struct kvm_msrs *__user msrs = u64_to_user_ptr((u64)arg);
+	struct kvm_msrs __user *msrs = u64_to_user_ptr((u64)arg);
+	struct kvm_msrs *kmsrs;
 	size_t size;
 	u32 nmsrs;
+	int err;
 
 	if (get_user(nmsrs, &msrs->nmsrs))
 		return -EFAULT;
 
-	size = offsetof(struct kvm_msrs, entries) +
-	       nmsrs * sizeof(struct kvm_msr_entry);
-	return virtio_kvm_send_command_ucopy(handle, VIRTIO_VM_IOCTL,
-					     ioctl, arg, size, data);
+	if (nmsrs > VIRTKVM_MAX_MSR_ENTRIES)
+		return -E2BIG;
+
+	size = struct_size(kmsrs, entries, nmsrs);
+	kmsrs = kzalloc(size, GFP_KERNEL);
+	if (!kmsrs)
+		return -ENOMEM;
+
+	if (copy_from_user(kmsrs, msrs, size)) {
+		kfree(kmsrs);
+		return -EFAULT;
+	}
+	kmsrs->nmsrs = nmsrs;
+
+	err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL, ioctl,
+				      __pa(kmsrs), data);
+	if (!err && copy_to_user(msrs, kmsrs, size))
+		err = -EFAULT;
+
+	kfree(kmsrs);
+	return err;
 }
 
 static int
@@ -136,7 +181,7 @@ virtio_kvm_handle_device_attr(u64 handle, unsigned int ioctl, unsigned long arg,
 {
 	struct kvm_device_attr __user *uattr = u64_to_user_ptr((u64)arg);
 	struct kvm_device_attr *attr = NULL;
-	u64 __user *uattr_data;
+	u64 __user *uattr_data = NULL;
 	const bool has_data = ioctl != KVM_HAS_DEVICE_ATTR;
 	u64 *attr_data = NULL;
 	int ret;
@@ -167,9 +212,9 @@ virtio_kvm_handle_device_attr(u64 handle, unsigned int ioctl, unsigned long arg,
 	ret = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL, ioctl,
 				      __pa(attr), data);
 
-	if (has_data) {
+	if (ioctl == KVM_GET_DEVICE_ATTR && !ret) {
 		if (copy_to_user(uattr_data, attr_data, sizeof(*attr_data)))
-			ret = ret ?: -EFAULT;
+			ret = -EFAULT;
 	}
 out:
 	kfree(attr_data);
@@ -180,83 +225,157 @@ out:
 static int
 virtio_kvm_handle_cpuid(u64 handle, unsigned int ioctl, unsigned long arg, u64 *data)
 {
-	struct kvm_cpuid2 *__user cpuid2 = u64_to_user_ptr((u64)arg);
+	struct kvm_cpuid2 __user *cpuid2 = u64_to_user_ptr((u64)arg);
+	struct kvm_cpuid2 *kcpuid;
 	size_t size;
 	u32 nent;
+	int err;
 
 	if (get_user(nent, &cpuid2->nent))
 		return -EFAULT;
 
-	size = offsetof(struct kvm_cpuid2, entries) +
-	       nent * sizeof(struct kvm_cpuid_entry2);
-	return virtio_kvm_send_command_ucopy(handle, VIRTIO_VM_IOCTL,
-					     ioctl, arg, size, data);
+	if (nent > VIRTKVM_MAX_CPUID_ENTRIES)
+		return -E2BIG;
+
+	size = struct_size(kcpuid, entries, nent);
+	kcpuid = kzalloc(size, GFP_KERNEL);
+	if (!kcpuid)
+		return -ENOMEM;
+
+	if (copy_from_user(kcpuid, cpuid2, size)) {
+		kfree(kcpuid);
+		return -EFAULT;
+	}
+	kcpuid->nent = nent;
+
+	err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL, ioctl,
+				      __pa(kcpuid), data);
+	if (!err && copy_to_user(cpuid2, kcpuid, size))
+		err = -EFAULT;
+
+	kfree(kcpuid);
+	return err;
 }
 
 static int
 virtio_kvm_handle_nested_state(u64 handle, unsigned int ioctl, unsigned long arg, u64 *data)
 {
 	struct kvm_nested_state __user *state = u64_to_user_ptr((u64)arg);
+	struct kvm_nested_state *kstate;
 	u32 size;
+	int err;
 
 	if (get_user(size, &state->size))
 		return -EFAULT;
 
-	if (!size)
+	if (size < sizeof(struct kvm_nested_state) ||
+	    size > VIRTKVM_MAX_NESTED_STATE_SIZE)
 		return -EINVAL;
 
-	return virtio_kvm_send_command_ucopy(handle, VIRTIO_VM_IOCTL,
-					     ioctl, arg, size, data);
+	kstate = kzalloc(size, GFP_KERNEL);
+	if (!kstate)
+		return -ENOMEM;
+
+	if (copy_from_user(kstate, state, size)) {
+		kfree(kstate);
+		return -EFAULT;
+	}
+	kstate->size = size;
+
+	err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL, ioctl,
+				      __pa(kstate), data);
+	if (!err && copy_to_user(state, kstate, size))
+		err = -EFAULT;
+
+	kfree(kstate);
+	return err;
 }
 
 static int
 virtio_kvm_set_pmu_event_filter(u64 handle, unsigned int ioctl, unsigned long arg)
 {
-	struct kvm_pmu_event_filter *__user filter = u64_to_user_ptr((u64)arg);
+	struct kvm_pmu_event_filter __user *filter = u64_to_user_ptr((u64)arg);
+	struct kvm_pmu_event_filter *kfilter;
 	size_t size;
 	u32 nevents;
+	int err;
 
 	if (get_user(nevents, &filter->nevents))
 		return -EFAULT;
 
-	size = offsetof(struct kvm_pmu_event_filter, events) +
-	       nevents * sizeof(__u64);
-	return virtio_kvm_send_command_ucopy(handle, VIRTIO_VM_IOCTL,
-					     ioctl, arg, size, NULL);
+	if (nevents > VIRTKVM_MAX_PMU_EVENTS)
+		return -E2BIG;
+
+	size = struct_size(kfilter, events, nevents);
+	kfilter = kzalloc(size, GFP_KERNEL);
+	if (!kfilter)
+		return -ENOMEM;
+
+	if (copy_from_user(kfilter, filter, size)) {
+		kfree(kfilter);
+		return -EFAULT;
+	}
+	kfilter->nevents = nevents;
+
+	err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL, ioctl,
+				      __pa(kfilter), NULL);
+	kfree(kfilter);
+	return err;
 }
 
 static int
 virtio_kvm_set_gsi_routing(u64 handle, unsigned int ioctl, unsigned long arg)
 {
-	struct kvm_irq_routing *__user routing = u64_to_user_ptr((u64)arg);
+	struct kvm_irq_routing __user *routing = u64_to_user_ptr((u64)arg);
+	struct kvm_irq_routing *krouting;
 	size_t size;
 	u32 nr;
+	int err;
 
 	if (get_user(nr, &routing->nr))
 		return -EFAULT;
 
-	size = offsetof(struct kvm_irq_routing, entries) +
-	       nr * sizeof(struct kvm_irq_routing_entry);
-	return virtio_kvm_send_command_ucopy(handle, VIRTIO_VM_IOCTL,
-					     ioctl, arg, size, NULL);
+	if (nr > VIRTKVM_MAX_IRQ_ROUTES)
+		return -EINVAL;
+
+	size = struct_size(krouting, entries, nr);
+	krouting = kzalloc(size, GFP_KERNEL);
+	if (!krouting)
+		return -ENOMEM;
+
+	if (copy_from_user(krouting, routing, size)) {
+		kfree(krouting);
+		return -EFAULT;
+	}
+	krouting->nr = nr;
+
+	err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL, ioctl,
+				      __pa(krouting), NULL);
+	kfree(krouting);
+	return err;
 }
 
 static int
 virtio_kvm_handle_xsave(struct virtio_kvm_vcpu *vcpu, unsigned int ioctl,
 			unsigned long arg, u64 *data)
 {
-	u64 size;
+	u64 size = sizeof(struct kvm_xsave);
 	int ret;
 
-	/*
-	 * KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2) returns the size of the
-	 * xsave state.
-	 */
-	ret = virtio_kvm_send_command(vcpu->vm->handle, VIRTIO_VM_IOCTL,
-				      KVM_CHECK_EXTENSION, KVM_CAP_XSAVE2,
-				      &size);
-	if (ret)
-		return ret;
+	if (ioctl != KVM_GET_XSAVE) {
+		/*
+		 * KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2) returns the size of the
+		 * extended xsave state when dynamic XSAVE features are enabled.
+		 */
+		ret = virtio_kvm_send_command(vcpu->vm->handle, VIRTIO_VM_IOCTL,
+					      KVM_CHECK_EXTENSION,
+					      KVM_CAP_XSAVE2, &size);
+		if (ret)
+			return ret;
+
+		if (size < sizeof(struct kvm_xsave))
+			size = sizeof(struct kvm_xsave);
+	}
 
 	return virtio_kvm_send_command_ucopy(vcpu->handle, VIRTIO_VM_IOCTL,
 					     ioctl, arg, size, NULL);
@@ -433,9 +552,21 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 	bool wake_thread = false;
 	int err;
 
+	if (mutex_lock_killable(&vcpu->mutex))
+		return -EINTR;
+
 	trace_virtio_vm_vcpu_run_entry(handle, vcpu->vcpu_id);
 
 	state = &vcpu->vm->shm->vcpus[vcpu->vcpu_id];
+
+	smp_store_release(&vcpu->completed, false);
+
+	spin_lock(&vi_device->vcpu_lock);
+	if (list_empty(&vcpu->active_link)) {
+		wake_thread = list_empty(&vi_device->active_vcpus);
+		list_add(&vcpu->active_link, &vi_device->active_vcpus);
+	}
+	spin_unlock(&vi_device->vcpu_lock);
 
 	/* 1. Set request state */
 	old_s = virt_load_acquire(&state->state);
@@ -450,17 +581,15 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 	/* 2. Host Wakeup (Kick) */
 	if (!(old_s & FLAG_HOST_POLLING)) {
 		trace_virtio_vm_ready(handle);
-		virtio_kvm_send_command_async(handle, VIRTIO_VM_READY, 0, 0, NULL);
+		err = virtio_kvm_send_command_async(handle, VIRTIO_VM_READY, 0, 0, NULL);
+		if (err) {
+			spin_lock(&vi_device->vcpu_lock);
+			list_del_init(&vcpu->active_link);
+			spin_unlock(&vi_device->vcpu_lock);
+			smp_store_release(&vcpu->completed, true);
+			goto out_reset_state;
+		}
 	}
-
-	smp_store_release(&vcpu->completed, false);
-
-	spin_lock(&vi_device->vcpu_lock);
-	if (list_empty(&vcpu->active_link)) {
-		wake_thread = list_empty(&vi_device->active_vcpus);
-		list_add(&vcpu->active_link, &vi_device->active_vcpus);
-	}
-	spin_unlock(&vi_device->vcpu_lock);
 
 	if (wake_thread)
 		wake_up(&vi_device->vcpu_poll_wait);
@@ -469,21 +598,32 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 	err = wait_event_interruptible(vcpu->wait, smp_load_acquire(&vcpu->completed));
 	if (err == -ERESTARTSYS) {
 		struct virtkvm_cmd *int_cmd;
+		int int_err = -ENOMEM;
 
 		/* Reflect interruption into host and wait for it to complete. */
 		trace_virtio_vm_cmd_int(handle);
 		int_cmd = kzalloc(sizeof(*int_cmd), GFP_KERNEL);
 		if (int_cmd) {
-			err = __virtio_kvm_send_command(int_cmd, handle, VIRTIO_VM_CMD_INT, 0,
-							0, NULL, COMMAND_ASYNC);
-			if (err)
+			int_err = __virtio_kvm_send_command(int_cmd, handle, VIRTIO_VM_CMD_INT, 0,
+							    0, NULL, COMMAND_ASYNC);
+			if (int_err)
 				kfree(int_cmd);
 		}
-		wait_event(vcpu->wait, smp_load_acquire(&vcpu->completed));
+		if (!int_err) {
+			wait_event(vcpu->wait, smp_load_acquire(&vcpu->completed));
+		} else {
+			spin_lock(&vi_device->vcpu_lock);
+			list_del_init(&vcpu->active_link);
+			spin_unlock(&vi_device->vcpu_lock);
+			smp_store_release(&vcpu->completed, true);
+			err = int_err;
+			goto out_reset_state;
+		}
 	}
 
 	/* 4. Result Processing */
 	err = state->status;
+out_reset_state:
 	/* Pair with virt_store_release in host */
 	old_s = smp_load_acquire(&state->state);
 	for (;;) {
@@ -495,6 +635,7 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 	}
 
 	trace_virtio_vm_vcpu_run_exit(handle, vcpu->vcpu_id, err);
+	mutex_unlock(&vcpu->mutex);
 
 	return err;
 }
@@ -546,7 +687,7 @@ virtio_kvm_vcpu_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		break;
 	case KVM_SET_SIGNAL_MASK:
 		err = 0;
-		WARN(err == 0, "KVM_SET_SIGNAL_MASK unimplented!");
+		pr_warn_once("KVM_SET_SIGNAL_MASK unimplemented!\n");
 		break;
 	CASE_KVM_IOCTL_UCOPY(KVM_SET_SREGS,	struct kvm_sregs);
 	CASE_KVM_IOCTL_UCOPY(KVM_GET_SREGS,	struct kvm_sregs);
@@ -610,14 +751,17 @@ virtio_kvm_vcpu_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	switch (ioctl) {
 	case KVM_GET_STATS_FD:
 		fd = get_unused_fd_flags(O_CLOEXEC);
-		if (fd < 0)
+		if (fd < 0) {
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			return fd;
+		}
 		file = anon_inode_getfile_fmode("kvm-vcpu-stats",
 						&kvm_stats_fops,
 						(void *)data, O_RDONLY,
 						FMODE_PREAD);
 		if (IS_ERR(file)) {
 			put_unused_fd(fd);
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			return PTR_ERR(file);
 		}
 		fd_install(fd, file);
@@ -731,26 +875,33 @@ update_mem_regions(struct virtio_kvm_vm *vm,
 		   struct kvm_userspace_memory_region2 *reg,
 		   struct virtio_kvm_mem_region *mem_region)
 {
+	struct virtio_kvm_mem_region *existing;
+
 	mutex_lock(&vm->region_lock);
 
+	existing = find_mem_region(vm, reg->slot);
 	if (mem_region) {
+		if (existing) {
+			existing->memory_size = reg->memory_size;
+			mutex_unlock(&vm->region_lock);
+			kfree(mem_region);
+			return;
+		}
 		/* Add */
 		mem_region->slot = reg->slot;
 		mem_region->memory_size = reg->memory_size;
 		list_add(&mem_region->link, &vm->memory_regions);
 	} else {
 		/* Remove */
-		mem_region = find_mem_region(vm, reg->slot);
-		if (!WARN_ON_ONCE(!mem_region)) {
-			list_del(&mem_region->link);
+		if (!WARN_ON_ONCE(!existing)) {
+			list_del(&existing->link);
 			mutex_unlock(&vm->region_lock);
-			kfree(mem_region);
+			kfree(existing);
 			return;
 		}
 	}
 
 	mutex_unlock(&vm->region_lock);
-
 }
 
 static long
@@ -960,7 +1111,10 @@ virtio_kvm_set_msr_filter(u64 handle, unsigned int ioctl, unsigned long arg)
 	for (i = 0; i < ARRAY_SIZE(kfilter->ranges); ++i) {
 		struct kvm_msr_filter_range *user_range = &kfilter->ranges[i];
 
-		bitmap_size = BITS_TO_LONGS(user_range->nmsrs) * sizeof(long);
+		if (user_range->nmsrs > KVM_MSR_FILTER_MAX_BITMAP_SIZE * BITS_PER_BYTE)
+			goto free_kfilter;
+
+		bitmap_size = BITS_TO_LONGS((size_t)user_range->nmsrs) * sizeof(long);
 		if (bitmap_size > KVM_MSR_FILTER_MAX_BITMAP_SIZE)
 			goto free_kfilter;
 
@@ -984,7 +1138,7 @@ virtio_kvm_set_msr_filter(u64 handle, unsigned int ioctl, unsigned long arg)
 		 * translate it to a PA here to provide to L0. L0 will
 		 * translate the PA to a usable L0 user pointer.
 		 */
-		bitmap_size = BITS_TO_LONGS(user_range->nmsrs) * sizeof(long);
+		bitmap_size = BITS_TO_LONGS((size_t)user_range->nmsrs) * sizeof(long);
 		bitmap_cur += bitmap_size;
 
 		if (bitmap_size && copy_from_user(bitmap,
@@ -1279,12 +1433,13 @@ virtio_kvm_irqfd_link_assign(struct virtio_kvm_vm *vm, struct kvm_irqfd *args)
 	init_waitqueue_func_entry(&irqfd->wait, irqfd_wakeup);
 	init_poll_funcptr(&irqfd->pt, irqfd_ptable_queue_proc);
 
+	events = vfs_poll(fd_file(f), &irqfd->pt);
+
 	/* Finally add the irqfd to the VM's list */
 	spin_lock_irq(&vm->fd_lock);
 	list_add(&irqfd->link, &vm->irqfds);
 	spin_unlock_irq(&vm->fd_lock);
 
-	events = vfs_poll(fd_file(f), &irqfd->pt);
 	if (events & EPOLLIN)
 		schedule_work(&irqfd->inject);
 
@@ -1682,6 +1837,7 @@ virtio_kvm_ioeventfd_deassign(struct virtio_kvm_vm *vm,
 {
 	struct virtio_kvm_ioeventfd_link *link = NULL, *tmp;
 	struct eventfd_ctx *eventfd;
+	int ret;
 
 	eventfd = eventfd_ctx_fdget(ioeventfd->kvm.fd);
 	if (IS_ERR(eventfd))
@@ -1689,9 +1845,15 @@ virtio_kvm_ioeventfd_deassign(struct virtio_kvm_vm *vm,
 
 	spin_lock_irq(&vm->fd_lock);
 	list_for_each_entry(tmp, &vm->ioeventfds, link) {
+		bool pio_match = (tmp->orig.flags & KVM_IOEVENTFD_FLAG_PIO) ==
+				 (ioeventfd->kvm.flags & KVM_IOEVENTFD_FLAG_PIO);
+		bool data_match = !(ioeventfd->kvm.flags & KVM_IOEVENTFD_FLAG_DATAMATCH) ||
+				  tmp->orig.datamatch == ioeventfd->kvm.datamatch;
+
 		if (tmp->evfd->ctx == eventfd &&
 		    tmp->orig.addr == ioeventfd->kvm.addr &&
-		    tmp->orig.len == ioeventfd->kvm.len) {
+		    tmp->orig.len == ioeventfd->kvm.len &&
+		    pio_match && data_match) {
 			link = tmp;
 			list_del(&link->link);
 			break;
@@ -1706,13 +1868,13 @@ virtio_kvm_ioeventfd_deassign(struct virtio_kvm_vm *vm,
 
 	ioeventfd->kvm.fd = -1;
 	ioeventfd->fd_handle = link->evfd->handle;
-	virtio_kvm_send_command(vm->handle, VIRTIO_VM_IOCTL, KVM_IOEVENTFD,
-				__pa(ioeventfd), NULL);
+	ret = virtio_kvm_send_command(vm->handle, VIRTIO_VM_IOCTL, KVM_IOEVENTFD,
+				      __pa(ioeventfd), NULL);
 
 	virtio_kvm_put_evfd(link->evfd);
 	kfree(link);
 
-	return 0;
+	return ret;
 }
 
 static long
@@ -1827,10 +1989,7 @@ virtio_kvm_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	CASE_KVM_IOCTL_UCOPY(KVM_SET_IDENTITY_MAP_ADDR, u64);
 	CASE_KVM_IOCTL_UCOPY(KVM_CREATE_PIT2,	struct kvm_pit_config);
 	CASE_KVM_IOCTL_UCOPY(KVM_IRQ_LINE,	struct kvm_irq_level);
-	case KVM_IRQ_LINE_STATUS:
-		err = virtio_kvm_send_command_ucopy_async(handle, VIRTIO_VM_IOCTL,
-							   ioctl, arg, sizeof(struct kvm_irq_level));
-		break;
+	CASE_KVM_IOCTL_UCOPY(KVM_IRQ_LINE_STATUS,	struct kvm_irq_level);
 	CASE_KVM_IOCTL_UCOPY(KVM_REGISTER_COALESCED_MMIO,	struct kvm_coalesced_mmio_zone);
 	CASE_KVM_IOCTL_UCOPY(KVM_UNREGISTER_COALESCED_MMIO,	struct kvm_coalesced_mmio_zone);
 	CASE_KVM_IOCTL_UCOPY(KVM_SIGNAL_MSI,	struct kvm_msi);
@@ -1857,20 +2016,24 @@ virtio_kvm_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	case KVM_CREATE_VCPU:
 		/*
 		 * Grab a ref on the vm file so that vcpu->vm is always valid.
-		 * It is impossible for grabbing a ref to fail, because we are
-		 * already holding a ref in this function.
 		 */
-		BUG_ON(filp != vm->file);
-		BUG_ON(!file_ref_get(&filp->f_ref));
+		if (WARN_ON_ONCE(filp != vm->file)) {
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
+			kfree(vcpu);
+			return -EINVAL;
+		}
+		get_file(filp);
 
 		fd = get_unused_fd_flags(O_CLOEXEC);
 		if (fd < 0) {
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			fput(filp);
 			kfree(vcpu);
 			return fd;
 		}
 		vcpu->vm = vm;
 		vcpu->handle = data;
+		mutex_init(&vcpu->mutex);
 		init_waitqueue_head(&vcpu->wait);
 		INIT_LIST_HEAD(&vcpu->active_link);
 		vcpu->completed = true;
@@ -1878,6 +2041,7 @@ virtio_kvm_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 					  (void *)vcpu, O_RDWR);
 		if (IS_ERR(file)) {
 			put_unused_fd(fd);
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			fput(filp);
 			kfree(vcpu);
 			return PTR_ERR(file);
@@ -1886,27 +2050,33 @@ virtio_kvm_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		return fd;
 	case KVM_GET_STATS_FD:
 		fd = get_unused_fd_flags(O_CLOEXEC);
-		if (fd < 0)
+		if (fd < 0) {
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			return fd;
+		}
 		file = anon_inode_getfile_fmode("kvm-vm-stats",
 						&kvm_stats_fops,
 						(void *)data, O_RDONLY,
 						FMODE_PREAD);
 		if (IS_ERR(file)) {
 			put_unused_fd(fd);
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			return PTR_ERR(file);
 		}
 		fd_install(fd, file);
 		return fd;
 	case KVM_CREATE_DEVICE:
 		fd = get_unused_fd_flags(O_CLOEXEC);
-		if (fd < 0)
+		if (fd < 0) {
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			return fd;
+		}
 		file = anon_inode_getfile("kvm-generic-device",
 					  &kvm_device_fops,
 					  (void *)data, O_RDWR | O_CLOEXEC);
 		if (IS_ERR(file)) {
 			put_unused_fd(fd);
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			return PTR_ERR(file);
 		}
 		fd_install(fd, file);
@@ -1941,9 +2111,11 @@ virtio_kvm_vm_release(struct inode *inode, struct file *filp)
 	}
 
 	/* Free all irqfds. */
+	spin_lock_irq(&vm->fd_lock);
 	list_for_each_entry_safe(irqfd, tmp_irqfd, &vm->irqfds, link) {
 		deactivate_irqfd(irqfd);
 	}
+	spin_unlock_irq(&vm->fd_lock);
 	flush_workqueue(eventfd_cleanup_wq);
 
 	if (vm->shm) {
@@ -1987,9 +2159,9 @@ static int virtio_kvm_vm_setup_shm(struct virtio_kvm_vm *vm)
 		return -ENOMEM;
 	}
 
-	mmap_device->size = vm->shm_size;
-	mmap_device->device_offset = 0;
-	mmap_device->phys_offset = vm->shm_phys_offset;
+	mmap_device->size = cpu_to_le64(vm->shm_size);
+	mmap_device->device_offset = cpu_to_le64(0);
+	mmap_device->phys_offset = cpu_to_le64(vm->shm_phys_offset);
 
 	err = virtio_kvm_send_command(vm->handle, VIRTIO_VM_DEVICE_MMAP, 0,
 				      __pa(mmap_device), NULL);
@@ -2107,6 +2279,7 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	case KVM_CREATE_VM:
 		fd = get_unused_fd_flags(O_CLOEXEC);
 		if (fd < 0) {
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			kfree(vm);
 			return fd;
 		}
@@ -2114,6 +2287,7 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 					  (void *) vm, O_RDWR);
 		if (IS_ERR(file)) {
 			put_unused_fd(fd);
+			virtio_kvm_send_command_async(data, VIRTIO_VM_CLOSE, 0, 0, NULL);
 			kfree(vm);
 			return PTR_ERR(file);
 		}
@@ -2191,8 +2365,6 @@ static int vcpu_polling_thread(void *data)
 				idle_since = 0;
 				continue;
 			}
-
-			continue;
 		}
 
 		cond_resched();
