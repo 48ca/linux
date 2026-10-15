@@ -540,7 +540,7 @@ static int virtkvm_vfio_group_open(struct inode *inode, struct file *filp)
 
 	if (group->part && group->part->vi) {
 		mutex_lock(&group->part->vi->partition_lock);
-		if (list_empty(&group->part->link)) {
+		if (group->part->dying || list_empty(&group->part->link)) {
 			mutex_unlock(&group->part->vi->partition_lock);
 			return -ENODEV;
 		}
@@ -942,7 +942,7 @@ static int virtkvm_vfio_open(struct inode *inode, struct file *filp)
 
 	if (part && part->vi) {
 		mutex_lock(&part->vi->partition_lock);
-		if (list_empty(&part->link)) {
+		if (part->dying || list_empty(&part->link)) {
 			mutex_unlock(&part->vi->partition_lock);
 			kfree(container);
 			return -ENODEV;

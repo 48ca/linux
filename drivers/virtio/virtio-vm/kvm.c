@@ -339,7 +339,7 @@ virtio_kvm_open(struct inode *inode, struct file *filp)
 
 	if (part->vi) {
 		mutex_lock(&part->vi->partition_lock);
-		if (list_empty(&part->link)) {
+		if (part->dying || list_empty(&part->link)) {
 			mutex_unlock(&part->vi->partition_lock);
 			kfree(ctx);
 			return -ENODEV;

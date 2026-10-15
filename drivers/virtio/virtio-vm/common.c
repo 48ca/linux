@@ -120,15 +120,18 @@ void virtio_vm_put_unused_phys_offset(u64 offset, u64 size)
 void virtio_kvm_eventfd_poll_done(struct virtio_kvm_poll *poll)
 {
 	struct virtio_kvm_eventfd *evfd;
-	int i, j;
+	u64 handle, val, j;
+	int i;
 
 	rcu_read_lock();
 	for (i = 0; i < VIRTIO_KVM_POLL_BATCH; i++) {
-		if (poll->handle[i] != -1) {
-			evfd = xa_load(&vi_device->ioeventfds, poll->handle[i]);
+		handle = le64_to_cpu(poll->handle[i]);
+		if (handle != -1ULL) {
+			evfd = xa_load(&vi_device->ioeventfds, handle);
 			if (!evfd)	/* Race w/ close */
 				continue;
-			for (j = 0; j < poll->vals[i]; j++) {
+			val = min_t(u64, le64_to_cpu(poll->vals[i]), 4096);
+			for (j = 0; j < val; j++) {
 				trace_virtio_vm_ioeventfd_signal(evfd->handle, evfd->id);
 				eventfd_signal(evfd->ctx);
 			}
@@ -146,7 +149,7 @@ static void kvm_request_done(struct virtkvm_cmd *cmd)
 	struct virtio_kvm_reqresp *buf = &cmd->r;
 	bool free_on_done = cmd->free_on_done;
 
-	switch (buf->req.operation) {
+	switch (le64_to_cpu(buf->req.operation)) {
 	case VIRTIO_VM_EVENTFD_POLL:
 		virtio_kvm_eventfd_poll_done(&buf->poll);
 		break;
@@ -210,10 +213,10 @@ __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle,
 
 	req = &cmd->r.req;
 	resp = &cmd->r.resp;
-	req->handle = handle;
-	req->operation = operation;
-	req->arg = oparg;
-	req->longarg = longarg;
+	req->handle = cpu_to_le64(handle);
+	req->operation = cpu_to_le64(operation);
+	req->arg = cpu_to_le64(oparg);
+	req->longarg = cpu_to_le64(longarg);
 
 	sg_init_one(&out, req, sizeof(*req));
 	sgs[0] = &out;
@@ -231,16 +234,23 @@ __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle,
 				needs_kick = virtqueue_kick_prepare(vi_device->vq);
 			}
 			spin_unlock_irqrestore(&vi_device->virtkvm_lock, flags);
-			if (!ret && needs_kick)
+			if (ret)
+				return ret;
+			if (needs_kick)
 				virtqueue_notify(vi_device->vq);
 			break;
 		}
 		vi_device->vq_full = true;
 		spin_unlock_irqrestore(&vi_device->virtkvm_lock, flags);
 
-		ret = wait_event_interruptible(vi_device->vq_wait, !vi_device->vq_full);
-		if (ret == -ERESTARTSYS)
-			return -EINTR;
+		if (mode == COMMAND_INTERRUPTIBLE) {
+			ret = wait_event_interruptible(vi_device->vq_wait,
+						       !vi_device->vq_full);
+			if (ret == -ERESTARTSYS)
+				return -EINTR;
+		} else {
+			wait_event(vi_device->vq_wait, !vi_device->vq_full);
+		}
 	}
 
 	switch (mode) {
@@ -279,12 +289,12 @@ __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle,
 	}
 
 	/* status is the positive errno */
-	ret = -(int)resp->status;
+	ret = -(int)le64_to_cpu(resp->status);
 
 	WARN_ON_ONCE(ret > 0);
 
 	if (!ret && data_out)
-		*data_out = resp->data;
+		*data_out = le64_to_cpu(resp->data);
 
 	return ret;
 }
@@ -777,13 +787,13 @@ void virtio_kvm_put_evfd(struct virtio_kvm_eventfd *evfd)
 void virtkvm_partition_get(struct virtio_kvm_partition *part)
 {
 	if (part)
-		atomic_inc(&part->refcnt);
+		refcount_inc(&part->refcnt);
 }
 
 void virtkvm_partition_put(struct virtio_kvm_partition *part)
 {
-	if (part)
-		atomic_dec(&part->refcnt);
+	if (part && refcount_dec_and_test(&part->refcnt))
+		kfree(part);
 }
 
 struct virtio_kvm_partition *virtkvm_partition_get_by_id(struct virtkvm_info *vi, u64 partition_id)
@@ -795,7 +805,7 @@ struct virtio_kvm_partition *virtkvm_partition_get_by_id(struct virtkvm_info *vi
 
 	guard(mutex)(&vi->partition_lock);
 	list_for_each_entry(part, &vi->partitions, link) {
-		if (part->partition_id == partition_id) {
+		if (part->partition_id == partition_id && !part->dying) {
 			virtkvm_partition_get(part);
 			return part;
 		}
@@ -827,31 +837,34 @@ int virtkvm_partition_create(struct virtkvm_info *vi, u64 partition_id)
 
 	part->partition_id = partition_id;
 	part->vi = vi;
-	atomic_set(&part->refcnt, 0);
+	part->dying = false;
+	refcount_set(&part->refcnt, 1);
 	INIT_LIST_HEAD(&part->link);
 	INIT_LIST_HEAD(&part->vfio_groups);
+	list_add_tail(&part->link, &vi->partitions);
+	mutex_unlock(&vi->partition_lock);
 
 	err = virtkvm_partition_init_kvm(part);
-	if (err) {
-		kfree(part);
-		mutex_unlock(&vi->partition_lock);
-		return err;
-	}
+	if (err)
+		goto err_unlink;
 
 	err = virtkvm_partition_init_vfio(part);
 	if (err) {
 		virtkvm_partition_cleanup_kvm(part);
-		kfree(part);
-		mutex_unlock(&vi->partition_lock);
-		return err;
+		goto err_unlink;
 	}
-
-	list_add_tail(&part->link, &vi->partitions);
-	mutex_unlock(&vi->partition_lock);
 
 	pr_info("Registered partition device /dev/%s for partition %llu\n",
 		part->nodename, partition_id);
 	return 0;
+
+err_unlink:
+	mutex_lock(&vi->partition_lock);
+	part->dying = true;
+	list_del_init(&part->link);
+	mutex_unlock(&vi->partition_lock);
+	virtkvm_partition_put(part);
+	return err;
 }
 
 int virtkvm_partition_destroy(struct virtkvm_info *vi, u64 partition_id)
@@ -864,7 +877,7 @@ int virtkvm_partition_destroy(struct virtkvm_info *vi, u64 partition_id)
 
 	mutex_lock(&vi->partition_lock);
 	list_for_each_entry_safe(part, tmp, &vi->partitions, link) {
-		if (part->partition_id == partition_id) {
+		if (part->partition_id == partition_id && !part->dying) {
 			found = true;
 			break;
 		}
@@ -875,11 +888,12 @@ int virtkvm_partition_destroy(struct virtkvm_info *vi, u64 partition_id)
 		return -ENOENT;
 	}
 
-	if (atomic_read(&part->refcnt) > 0) {
+	if (refcount_read(&part->refcnt) > 1) {
 		mutex_unlock(&vi->partition_lock);
 		return -EBUSY;
 	}
 
+	part->dying = true;
 	list_del_init(&part->link);
 	mutex_unlock(&vi->partition_lock);
 
@@ -887,30 +901,39 @@ int virtkvm_partition_destroy(struct virtkvm_info *vi, u64 partition_id)
 	virtkvm_partition_cleanup_kvm(part);
 	pr_info("Deregistered partition device /dev/%s for partition %llu\n",
 		part->nodename, partition_id);
-	kfree(part);
+	virtkvm_partition_put(part);
 	return 0;
 }
 
 void virtkvm_partitions_cleanup(struct virtkvm_info *vi)
 {
 	struct virtio_kvm_partition *part, *tmp;
+	LIST_HEAD(to_destroy);
 
 	if (!vi)
 		return;
 
 	mutex_lock(&vi->partition_lock);
 	list_for_each_entry_safe(part, tmp, &vi->partitions, link) {
-		list_del(&part->link);
-		virtkvm_partition_cleanup_vfio(part);
-		virtkvm_partition_cleanup_kvm(part);
-		kfree(part);
+		part->dying = true;
+		list_move_tail(&part->link, &to_destroy);
 	}
 	mutex_unlock(&vi->partition_lock);
+
+	list_for_each_entry_safe(part, tmp, &to_destroy, link) {
+		list_del_init(&part->link);
+		virtkvm_partition_cleanup_vfio(part);
+		virtkvm_partition_cleanup_kvm(part);
+		virtkvm_partition_put(part);
+	}
 }
 
 static long
 tachyon_ctrl_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	switch (ioctl) {
 	case TACHYON_IOC_CREATE_PARTITION:
 		return virtkvm_partition_create(vi_device, arg);
@@ -943,11 +966,13 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	struct virtkvm_info *vi = NULL;
 	struct virtio_pci_device *vp;
 
+	if (!dev_is_pci(vdev->dev.parent))
+		return -ENODEV;
+
 	vi = kzalloc(sizeof(struct virtkvm_info), GFP_KERNEL);
 	if (!vi)
 		return -ENOMEM;
 
-	eventfd_cleanup_wq = NULL;
 	atomic_set(&vi->poll_pending, 0);
 
 	vdev->priv = vi;
@@ -957,7 +982,7 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	err = pci_request_region(vp->pci_dev, 4, "virtio-kvm");
 	if (err) {
 		pr_err("failed to request virtio-kvm BAR4\n");
-		goto err;
+		goto err_free_vi;
 	}
 
 	vi->phys_start = pci_resource_start(vp->pci_dev, 4);
@@ -970,7 +995,7 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	vi->vq = virtio_find_single_vq(vdev, kvm_requestq_done, "requestq");
 	if (IS_ERR(vi->vq)) {
 		err = PTR_ERR(vi->vq);
-		goto err;
+		goto err_destroy_mt;
 	}
 
 	xa_init(&vi->ioeventfds);
@@ -983,40 +1008,45 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	INIT_LIST_HEAD(&vi->partitions);
 	mutex_init(&vi->partition_lock);
 
-	err = -ENOMEM;
 	eventfd_cleanup_wq = alloc_workqueue("virtio-kvm-eventfd-cleanup", 0, 0);
-	if (!eventfd_cleanup_wq)
-		goto err;
+	if (!eventfd_cleanup_wq) {
+		err = -ENOMEM;
+		goto err_del_vqs;
+	}
+
+	err = virtkvm_kvm_init(vi);
+	if (err)
+		goto err_destroy_wq;
+
+	err = virtkvm_vfio_init(vi);
+	if (err)
+		goto err_cleanup_kvm;
+
+	vi_device = vi;
+	virtio_device_ready(vdev);
 
 	err = misc_register(&tachyon_ctrl_dev);
 	if (err)
-		goto err;
-
-	err = virtkvm_kvm_init(vi);
-	if (err) {
-		misc_deregister(&tachyon_ctrl_dev);
-		goto err;
-	}
-
-	err = virtkvm_vfio_init(vi);
-	if (err) {
-		virtkvm_kvm_cleanup(vi);
-		misc_deregister(&tachyon_ctrl_dev);
-		goto err;
-	}
-
-	virtio_device_ready(vdev);
-	vi_device = vi;
+		goto err_reset_dev;
 
 	return 0;
 
-err:
-	virtkvm_partitions_cleanup(vi);
-	if (eventfd_cleanup_wq)
-		destroy_workqueue(eventfd_cleanup_wq);
+err_reset_dev:
+	virtio_reset_device(vdev);
+	vi_device = NULL;
+	virtkvm_vfio_cleanup(vi);
+err_cleanup_kvm:
+	virtkvm_kvm_cleanup(vi);
+err_destroy_wq:
+	destroy_workqueue(eventfd_cleanup_wq);
+	eventfd_cleanup_wq = NULL;
+err_del_vqs:
+	vdev->config->del_vqs(vdev);
+	ida_destroy(&vi->evfd_ida);
+err_destroy_mt:
 	mtree_destroy(&vi->allocinfo.mt);
-	vp = to_vp_device(vdev);
 	pci_release_region(vp->pci_dev, 4);
+err_free_vi:
 	kfree(vi);
 	return err;
 }
@@ -1026,10 +1056,15 @@ static void remove_common(struct virtio_device *vdev)
 	struct virtkvm_info *vi = vdev->priv;
 	struct virtio_pci_device *vp;
 
-	if (eventfd_cleanup_wq)
-		destroy_workqueue(eventfd_cleanup_wq);
-
 	virtio_reset_device(vdev);
+
+	if (eventfd_cleanup_wq) {
+		destroy_workqueue(eventfd_cleanup_wq);
+		eventfd_cleanup_wq = NULL;
+	}
+
+	rcu_barrier();
+
 	vdev->config->del_vqs(vdev);
 
 	vp = to_vp_device(vdev);
@@ -1037,6 +1072,7 @@ static void remove_common(struct virtio_device *vdev)
 
 	mtree_destroy(&vi->allocinfo.mt);
 	ida_destroy(&vi->evfd_ida);
+	vi_device = NULL;
 	kfree(vi);
 }
 

@@ -135,16 +135,17 @@ struct virtkvm_info {
 
 struct virtio_kvm_partition {
 	u64 partition_id;
-	char name[32];
+	char name[64];
 	char nodename[64];
 	struct miscdevice misc_dev;
 	struct miscdevice vfio_container_dev;
-	char vfio_container_name[32];
+	char vfio_container_name[64];
 	char vfio_container_nodename[64];
 	struct list_head vfio_groups;
 	struct list_head link;
 	struct virtkvm_info *vi;
-	atomic_t refcnt;
+	refcount_t refcnt;
+	bool dying;
 };
 
 void virtkvm_partition_get(struct virtio_kvm_partition *part);
