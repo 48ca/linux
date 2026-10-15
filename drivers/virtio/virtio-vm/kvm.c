@@ -382,22 +382,10 @@ virtio_kvm_release(struct inode *inode, struct file *filp)
 	return ret;
 }
 
-static void vcpu_vma_close(struct vm_area_struct *vma)
-{
-	struct file *filp = vma->vm_file;
-	struct virtio_kvm_vcpu *vcpu = filp->private_data;
-	u64 handle = (u64)vcpu->handle;
-	u64 phys_offset = (u64)vma->vm_private_data;
-	int ret;
-
-	ret = send_dev_munmap(handle, phys_offset, vma->vm_end - vma->vm_start);
-	if (ret)
-		pr_warn_once("Failed to unmap VMA: %llx\n", handle);
-	virtio_vm_put_unused_phys_offset(phys_offset, vma->vm_end - vma->vm_start);
-}
-
 static const struct vm_operations_struct vcpu_vm_ops = {
-	.close = vcpu_vma_close,
+	.open = virtio_vm_vma_open,
+	.close = virtio_vm_vma_close,
+	.may_split = virtio_vm_vma_may_split,
 };
 
 static int
@@ -682,21 +670,10 @@ virtio_kvm_device_release(struct inode *inode, struct file *filp)
 	return ret;
 }
 
-static void device_vma_close(struct vm_area_struct *vma)
-{
-	struct file *filp = vma->vm_file;
-	u64 handle = (u64)filp->private_data;
-	u64 pa = (u64)vma->vm_private_data;
-	int ret;
-
-	ret = send_dev_munmap(handle, pa, vma->vm_end - vma->vm_start);
-	if (ret)
-		pr_warn_once("Failed to unmap VMA: %llx\n", handle);
-	virtio_vm_put_unused_phys_offset(pa, vma->vm_end - vma->vm_start);
-}
-
 static const struct vm_operations_struct device_vm_ops = {
-	.close = device_vma_close,
+	.open = virtio_vm_vma_open,
+	.close = virtio_vm_vma_close,
+	.may_split = virtio_vm_vma_may_split,
 };
 
 static int

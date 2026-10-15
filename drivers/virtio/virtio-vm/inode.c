@@ -16,6 +16,7 @@
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
 #include <linux/seq_file.h>
+#include <linux/overflow.h>
 
 #include "common.h"
 #include "kvm.h"
@@ -52,17 +53,25 @@ virtio_kvm_memory_file_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct kvm_guest_memory_file *gfile =
 		(struct kvm_guest_memory_file *)filp->private_data;
+	unsigned long gsize = smp_load_acquire(&gfile->size);
+	unsigned long vma_size = vma->vm_end - vma->vm_start;
+	u64 offset, end;
 	int err;
 
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EINVAL;
 
-	if ((vma->vm_pgoff << PAGE_SHIFT) + (vma->vm_end - vma->vm_start)
-			> gfile->size)
+	if (!gsize ||
+	    check_shl_overflow((u64)vma->vm_pgoff, PAGE_SHIFT, &offset) ||
+	    check_add_overflow(offset, (u64)vma_size, &end) ||
+	    end > gsize)
 		return -EINVAL;
 
-	err = remap_pfn_range(vma, vma->vm_start, gfile->pfn + vma->vm_pgoff,
-			      vma->vm_end - vma->vm_start, vma->vm_page_prot);
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+
+	err = remap_pfn_range(vma, vma->vm_start,
+			      READ_ONCE(gfile->pfn) + vma->vm_pgoff,
+			      vma_size, vma->vm_page_prot);
 	if (WARN_ON_ONCE(err))
 		return err;
 
@@ -83,14 +92,16 @@ bool virtio_kvm_is_vkvmfs(struct file *filp)
 	return filp->f_op->mmap == virtio_kvm_memory_file_mmap;
 }
 
-int vkvmfs_offset_to_pa(struct file *filp, off_t offset, size_t size, unsigned long *pa)
+int vkvmfs_offset_to_pa(struct file *filp, u64 offset, size_t size, unsigned long *pa)
 {
 	struct kvm_guest_memory_file *gfile = (struct kvm_guest_memory_file *)filp->private_data;
+	unsigned long gsize = smp_load_acquire(&gfile->size);
+	u64 end;
 
-	if (offset + size > gfile->size)
+	if (!gsize || check_add_overflow(offset, (u64)size, &end) || end > gsize)
 		return -E2BIG;
 
-	*pa = (gfile->pfn << PAGE_SHIFT) + offset;
+	*pa = (READ_ONCE(gfile->pfn) << PAGE_SHIFT) + offset;
 	return 0;
 }
 
@@ -128,11 +139,10 @@ static int virtio_kvm_init_memory_file_pdata(void **private_data)
 
 	*private_data = NULL;
 
-	gfile = (struct kvm_guest_memory_file *)kmalloc(sizeof(*gfile), GFP_KERNEL);
+	gfile = kzalloc(sizeof(*gfile), GFP_KERNEL);
 	if (!gfile)
 		return -ENOMEM;
 
-	gfile->size = 0;
 	*private_data = (void *)gfile;
 
 	return 0;
@@ -151,7 +161,7 @@ static int virtio_kvm_create_memory_file(struct kvm_guest_memory_file *gfile,
 	};
 	struct kvm_guest_memory_file_io *h;
 
-	if (WARN_ON_ONCE(!size))
+	if (!size || !PAGE_ALIGNED(size))
 		return -EINVAL;
 
 	h = kzalloc(sizeof(*h), GFP_KERNEL);
@@ -176,10 +186,11 @@ static int virtio_kvm_create_memory_file(struct kvm_guest_memory_file *gfile,
 		return err;
 	}
 
-	gfile->size = h->size;
-	gfile->pfn = (phys_offset + vi_device->phys_start) >> PAGE_SHIFT;
-	gfile->handle = h->handle;
-	gfile->part = virtkvm_partition_get_by_id(vi_device, partition_id);
+	WRITE_ONCE(gfile->pfn, (phys_offset + vi_device->phys_start) >> PAGE_SHIFT);
+	WRITE_ONCE(gfile->handle, h->handle);
+	WRITE_ONCE(gfile->part, virtkvm_partition_get_by_id(vi_device, partition_id));
+	/* Pair with smp_load_acquire(&gfile->size) in mmap and offset_to_pa */
+	smp_store_release(&gfile->size, h->size);
 
 	pr_debug("guest memory file placed at %lx\n", gfile->pfn);
 
@@ -275,8 +286,7 @@ static int vkvmfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 		gfile = inode->i_private;
 
-		/* Resizing from zero is allowed. */
-		if (oldsize)
+		if (oldsize || newsize < 0 || !PAGE_ALIGNED(newsize))
 			return -EINVAL;
 
 		if (!newsize)
@@ -452,8 +462,7 @@ static int vkvmfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		if (opt != -ENOPARAM)
 			return opt;
 
-		pr_err("unknown parameter for vkvmfs: %s\n", param->key);
-		return 0;
+		return invalfc(fc, "unknown parameter for vkvmfs: %s", param->key);
 	}
 	if (opt < 0)
 		return opt;

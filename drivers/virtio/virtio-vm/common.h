@@ -186,6 +186,17 @@ int __virtio_kvm_send_command_ucopy(u64 handle, unsigned int operation, unsigned
 int virtio_kvm_send_command_ucopy_async(u64 handle, unsigned int operation,
 					unsigned int ioctl, unsigned long arg,
 					size_t size);
+struct virtio_vm_mmap_region {
+	refcount_t refcnt;
+	u64 handle;
+	u64 phys_offset;
+	size_t size;
+};
+
+void virtio_vm_vma_open(struct vm_area_struct *vma);
+void virtio_vm_vma_close(struct vm_area_struct *vma);
+int virtio_vm_vma_may_split(struct vm_area_struct *vma, unsigned long addr);
+
 int virtio_kvm_generic_mmap(u64 handle, struct vm_area_struct *vma,
 			    const struct vm_operations_struct *vm_ops);
 

@@ -2,6 +2,8 @@
 
 #include <linux/virtio.h>
 #include <linux/miscdevice.h>
+#include <linux/mm.h>
+#include <linux/overflow.h>
 
 #include "common.h"
 #include "vfio.h"
@@ -411,6 +413,34 @@ virtio_kvm_send_command_ucopy_async(u64 handle, unsigned int operation,
 	return 0;
 }
 
+void virtio_vm_vma_open(struct vm_area_struct *vma)
+{
+	struct virtio_vm_mmap_region *region = vma->vm_private_data;
+
+	if (region)
+		refcount_inc(&region->refcnt);
+}
+
+void virtio_vm_vma_close(struct vm_area_struct *vma)
+{
+	struct virtio_vm_mmap_region *region = vma->vm_private_data;
+	int ret;
+
+	if (!region || !refcount_dec_and_test(&region->refcnt))
+		return;
+
+	ret = send_dev_munmap(region->handle, region->phys_offset, region->size);
+	if (ret)
+		pr_warn_once("Failed to unmap VMA: %llx\n", region->handle);
+	virtio_vm_put_unused_phys_offset(region->phys_offset, region->size);
+	kfree(region);
+}
+
+int virtio_vm_vma_may_split(struct vm_area_struct *vma, unsigned long addr)
+{
+	return -EINVAL;
+}
+
 int virtio_kvm_generic_mmap(u64 handle, struct vm_area_struct *vma,
 			    const struct vm_operations_struct *vm_ops)
 {
@@ -421,7 +451,9 @@ int virtio_kvm_generic_mmap(u64 handle, struct vm_area_struct *vma,
 	} __attribute__((packed));
 
 	struct virtio_kvm_mmap_device *mmap_device;
+	struct virtio_vm_mmap_region *region;
 	size_t size = vma->vm_end - vma->vm_start;
+	u64 dev_offset;
 	u64 new_offset;
 	u64 new_pa;
 	int err;
@@ -429,19 +461,29 @@ int virtio_kvm_generic_mmap(u64 handle, struct vm_area_struct *vma,
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EINVAL;
 
-	mmap_device = kzalloc(sizeof(*mmap_device), GFP_KERNEL);
-	if (!mmap_device)
+	if (!size || check_shl_overflow((u64)vma->vm_pgoff, PAGE_SHIFT, &dev_offset))
+		return -EINVAL;
+
+	region = kzalloc(sizeof(*region), GFP_KERNEL);
+	if (!region)
 		return -ENOMEM;
+
+	mmap_device = kzalloc(sizeof(*mmap_device), GFP_KERNEL);
+	if (!mmap_device) {
+		kfree(region);
+		return -ENOMEM;
+	}
 
 	new_offset = virtio_vm_get_unused_phys_offset(size, PAGE_SHIFT);
 	if (new_offset == INVALID_PHYS_OFFSET) {
 		kfree(mmap_device);
+		kfree(region);
 		return -ENOMEM;
 	}
 
-	mmap_device->size = size;
-	mmap_device->device_offset = vma->vm_pgoff << PAGE_SHIFT;
-	mmap_device->phys_offset = new_offset;
+	mmap_device->size = cpu_to_le64(size);
+	mmap_device->device_offset = cpu_to_le64(dev_offset);
+	mmap_device->phys_offset = cpu_to_le64(new_offset);
 
 	err = virtio_kvm_send_command(handle, VIRTIO_VM_DEVICE_MMAP, 0,
 				      __pa(mmap_device), NULL);
@@ -450,19 +492,25 @@ int virtio_kvm_generic_mmap(u64 handle, struct vm_area_struct *vma,
 
 	if (err) {
 		virtio_vm_put_unused_phys_offset(new_offset, size);
+		kfree(region);
 		return err;
 	}
 
 	new_pa = new_offset + vi_device->phys_start;
 
+	refcount_set(&region->refcnt, 1);
+	region->handle = handle;
+	region->phys_offset = new_offset;
+	region->size = size;
+
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_ops = vm_ops;
+	vma->vm_private_data = region;
 
 	err = remap_pfn_range(vma, vma->vm_start, new_pa >> PAGE_SHIFT,
-			      vma->vm_end - vma->vm_start, vma->vm_page_prot);
+			      size, vma->vm_page_prot);
 	if (err)
 		goto undo;
-
-	vma->vm_private_data = (void *)new_offset;
 
 	return 0;
 
@@ -470,11 +518,12 @@ undo:
 	{
 		int ret;
 
-		ret = send_dev_munmap(handle, new_offset,
-				      vma->vm_end - vma->vm_start);
+		vma->vm_private_data = NULL;
+		ret = send_dev_munmap(handle, new_offset, size);
 		if (ret)
 			pr_warn_once("Failed to unmap VMA: %llx\n", handle);
 		virtio_vm_put_unused_phys_offset(new_offset, size);
+		kfree(region);
 	}
 
 	return err;
@@ -486,13 +535,15 @@ virtio_kvm_file_chunk_io(u64 handle, char __user *user_buffer,
 			 struct virtio_kvm_file_io *file_io,
 			 int direction)
 {
+	bool is_read = (direction == VIRTIO_VM_FILEIO_READ);
+	unsigned int gup_flags = is_read ? FOLL_WRITE : 0;
 	unsigned long offset_into_page;
 	struct page *page;
 	u64 amount_read;
 	ssize_t ret;
 
-	ret = get_user_pages_unlocked((unsigned long)user_buffer, 1, &page,
-				      FOLL_WRITE);
+	ret = pin_user_pages_unlocked((unsigned long)user_buffer, 1, &page,
+				      gup_flags);
 	if (ret != 1) {
 		WARN_ON_ONCE(ret >= 0);
 		return ret;
@@ -512,10 +563,10 @@ virtio_kvm_file_chunk_io(u64 handle, char __user *user_buffer,
 	else
 		ret = amount_read;
 
-	if (WARN_ON_ONCE(ret > size))
-		ret = size;
+	if (WARN_ON_ONCE(ret > file_io->size))
+		ret = file_io->size;
 
-	put_page(page);
+	unpin_user_pages_dirty_lock(&page, 1, is_read && ret > 0);
 
 	return ret;
 }
@@ -586,9 +637,14 @@ int translate_va_to_pa(unsigned long va, unsigned long *phys_addr,
 		       size_t size)
 {
 	struct vm_area_struct *vma;
-	off_t vma_offset;
+	unsigned long va_end;
+	u64 vma_offset;
+	u64 pgoff_bytes;
 	u64 file_offset;
 	int ret;
+
+	if (!size || check_add_overflow(va, size, &va_end))
+		return -EINVAL;
 
 	ret = -EFAULT;
 	mmap_read_lock(current->mm);
@@ -599,25 +655,38 @@ int translate_va_to_pa(unsigned long va, unsigned long *phys_addr,
 	if (va < vma->vm_start || vma->vm_end <= va)
 		goto unlock;
 
+	if (!(vma->vm_flags & VM_READ))
+		goto unlock;
+
 	ret = -ENOTSUPP;
 	if (!vma->vm_file)
 		goto unlock;
 
 	/* Memory region must lie within a single VMA for now */
 	ret = -E2BIG;
-	if (va + size > vma->vm_end)
+	if (va_end > vma->vm_end)
 		goto unlock;
 
 	vma_offset = va - vma->vm_start;
-	file_offset = (vma->vm_pgoff << PAGE_SHIFT) + vma_offset;
+	if (check_shl_overflow((u64)vma->vm_pgoff, PAGE_SHIFT, &pgoff_bytes) ||
+	    check_add_overflow(pgoff_bytes, vma_offset, &file_offset)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
 
 	if (virtio_kvm_is_vkvmfs(vma->vm_file)) {
 		ret = vkvmfs_offset_to_pa(vma->vm_file, file_offset, size,
 					  phys_addr);
 	} else if (virtio_kvm_is_vfio_device(vma)) {
+		struct virtio_vm_mmap_region *region = vma->vm_private_data;
+
+		if (!region || vma_offset + size > region->size) {
+			ret = -E2BIG;
+			goto unlock;
+		}
 		/* This works for any generic device mmap; used for VFIO. */
 		ret = 0;
-		*phys_addr = (unsigned long)vma->vm_private_data +
+		*phys_addr = region->phys_offset +
 			     vi_device->phys_start + vma_offset;
 	} else {
 		ret = -ENOTSUPP;
@@ -641,8 +710,8 @@ long send_dev_munmap(u64 handle, unsigned long phys_offset, unsigned long size)
 	if (!munmap_dev)
 		return -ENOMEM;
 
-	munmap_dev->phys_offset = phys_offset;
-	munmap_dev->size = size;
+	munmap_dev->phys_offset = cpu_to_le64(phys_offset);
+	munmap_dev->size = cpu_to_le64(size);
 
 	ret = virtio_kvm_send_command(handle, VIRTIO_VM_DEVICE_MUNMAP, 0,
 				      __pa(munmap_dev), NULL);

@@ -127,22 +127,10 @@ static ssize_t virtkvm_vfio_device_write(struct file *filp,
 	return virtio_kvm_file_write(device->handle, buf, count, ppos);
 }
 
-static void vfio_device_vma_close(struct vm_area_struct *vma)
-{
-	struct file *filp = vma->vm_file;
-	struct virtkvm_vfio_device *device = filp->private_data;
-	u64 handle = (u64)device->handle;
-	u64 phys_offset = (u64)vma->vm_private_data;
-	int ret;
-
-	ret = send_dev_munmap(handle, phys_offset, vma->vm_end - vma->vm_start);
-	if (ret)
-		pr_warn_once("Failed to unmap VMA: %llx\n", handle);
-	virtio_vm_put_unused_phys_offset(phys_offset, vma->vm_end - vma->vm_start);
-}
-
 static const struct vm_operations_struct vfio_device_vm_ops = {
-	.close = vfio_device_vma_close,
+	.open = virtio_vm_vma_open,
+	.close = virtio_vm_vma_close,
+	.may_split = virtio_vm_vma_may_split,
 };
 
 bool virtio_kvm_is_vfio_device(const struct vm_area_struct *vma)
