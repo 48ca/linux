@@ -76,7 +76,7 @@ do {									\
 	case 4: __put_user_asm(x, ptr, retval, 4, "s32i", __cb); break;	\
 	case 8: {							\
 		     __typeof__(*ptr) __v64 = x;			\
-		     retval = __copy_to_user(ptr, &__v64, 8) ? -EFAULT : 0;	\
+		     retval = raw_copy_to_user(ptr, &__v64, 8) ? -EFAULT : 0;	\
 		     break;						\
 	        }							\
 	default: __put_user_bad();					\
@@ -176,7 +176,7 @@ do {									\
 	case 4: __get_user_asm(x, ptr, retval, 4, "l32i", __cb);  break;\
 	case 8: {							\
 		u64 __x;						\
-		if (unlikely(__copy_from_user(&__x, ptr, 8))) {		\
+		if (unlikely(raw_copy_from_user(&__x, ptr, 8))) {	\
 			retval = -EFAULT;				\
 			(x) = (__typeof__(*(ptr)))0;			\
 		} else {						\

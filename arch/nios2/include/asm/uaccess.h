@@ -161,7 +161,7 @@ do {									\
 	default:							\
 		/* XXX: This looks wrong... */				\
 		__pu_err = 0;						\
-		if (__copy_to_user(__pu_ptr, &(__pu_val),		\
+		if (raw_copy_to_user(__pu_ptr, &(__pu_val),		\
 			sizeof(*__pu_ptr)))				\
 			__pu_err = -EFAULT;				\
 		break;							\
