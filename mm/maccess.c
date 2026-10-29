@@ -116,6 +116,10 @@ Efault:
  *
  * Safely read from user address @src to the buffer at @dst. If a kernel fault
  * happens, handle that and return -EFAULT.
+ *
+ * The current task must have an mm. Callers that may run without one, e.g.
+ * tracing helpers that can run in kernel threads, must check current->mm
+ * themselves first.
  */
 long copy_from_user_nofault(void *dst, const void __user *src, size_t size)
 {
@@ -145,6 +149,10 @@ EXPORT_SYMBOL_GPL(copy_from_user_nofault);
  *
  * Safely write to address @dst from the buffer at @src.  If a kernel fault
  * happens, handle that and return -EFAULT.
+ *
+ * The current task must have an mm. Callers that may run without one, e.g.
+ * tracing helpers that can run in kernel threads, must check current->mm
+ * themselves first.
  */
 long copy_to_user_nofault(void __user *dst, const void *src, size_t size)
 {
@@ -179,6 +187,10 @@ EXPORT_SYMBOL_GPL(copy_to_user_nofault);
  *
  * If @count is smaller than the length of the string, copies @count-1 bytes,
  * sets the last byte of @dst buffer to NUL and returns @count.
+ *
+ * The current task must have an mm. Callers that may run without one, e.g.
+ * tracing helpers that can run in kernel threads, must check current->mm
+ * themselves first.
  */
 long strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr,
 			      long count)
@@ -217,6 +229,10 @@ long strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr,
  *
  * Unlike strnlen_user, this can be used from IRQ handler etc. because
  * it disables pagefaults.
+ *
+ * The current task must have an mm. Callers that may run without one, e.g.
+ * tracing helpers that can run in kernel threads, must check current->mm
+ * themselves first.
  */
 long strnlen_user_nofault(const void __user *unsafe_addr, long count)
 {
