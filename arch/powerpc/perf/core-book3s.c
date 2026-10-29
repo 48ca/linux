@@ -471,6 +471,13 @@ static __u64 power_pmu_bhrb_to(u64 addr)
 		return branch_target(&instr);
 	}
 
+	/*
+	 * The PMU interrupt may hit a task without an mm, e.g. a kernel
+	 * thread, which has no user memory to read.
+	 */
+	if (!current->mm)
+		return 0;
+
 	/* Userspace: need copy instruction here then translate it */
 	if (copy_from_user_nofault(&instr, (unsigned int __user *)addr,
 			sizeof(instr)))
