@@ -449,9 +449,18 @@ static unsigned int trace_string(struct synth_trace_event *entry,
 		str_field = (char *)&entry->fields[*n_u64].as_u64;
 
 #ifdef CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
-		if ((unsigned long)str_val < TASK_SIZE)
-			ret = strncpy_from_user_nofault(str_field, (const void __user *)str_val, STR_VAR_LEN_MAX);
-		else
+		if ((unsigned long)str_val < TASK_SIZE) {
+			/*
+			 * Synthetic events may fire in any context, including
+			 * kernel threads, which have no user memory to read.
+			 */
+			if (unlikely(!current->mm))
+				ret = -EFAULT;
+			else
+				ret = strncpy_from_user_nofault(str_field,
+						(const void __user *)str_val,
+						STR_VAR_LEN_MAX);
+		} else
 #endif
 			ret = strncpy_from_kernel_nofault(str_field, str_val, STR_VAR_LEN_MAX);
 

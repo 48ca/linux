@@ -14,6 +14,13 @@ fetch_store_strlen_user(unsigned long addr)
 {
 	const void __user *uaddr = (__force const void __user *)addr;
 
+	/*
+	 * Probes may fire in any context, including kernel threads and exiting
+	 * tasks, which have no user memory to read. That's not a kernel bug,
+	 * so fail (like a fault would) before the user copy helpers warn.
+	 */
+	if (unlikely(!current->mm))
+		return 0;
 	return strnlen_user_nofault(uaddr, MAX_STRING_SIZE);
 }
 
@@ -61,7 +68,11 @@ fetch_store_string_user(unsigned long addr, void *dest, void *base)
 
 	__dest = get_loc_data(dest, base);
 
-	ret = strncpy_from_user_nofault(__dest, uaddr, maxlen);
+	/* No user memory without an mm, see fetch_store_strlen_user(). */
+	if (unlikely(!current->mm))
+		ret = -EFAULT;
+	else
+		ret = strncpy_from_user_nofault(__dest, uaddr, maxlen);
 	set_data_loc(ret, dest, __dest, base);
 
 	return ret;
@@ -103,6 +114,9 @@ probe_mem_read_user(void *dest, void *src, size_t size)
 {
 	const void __user *uaddr =  (__force const void __user *)src;
 
+	/* No user memory without an mm, see fetch_store_strlen_user(). */
+	if (unlikely(!current->mm))
+		return -EFAULT;
 	return copy_from_user_nofault(dest, uaddr, size);
 }
 

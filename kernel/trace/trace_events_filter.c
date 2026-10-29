@@ -824,6 +824,14 @@ static __always_inline char *test_ustring(char *str)
 	ubuf = this_cpu_ptr(ustring_per_cpu);
 	kstr = ubuf->buffer;
 
+	/*
+	 * Events may fire in any context, including kernel threads and exiting
+	 * tasks, which have no user memory to read. That's not a kernel bug,
+	 * so fail before the user copy helpers warn about it.
+	 */
+	if (unlikely(!current->mm))
+		return NULL;
+
 	/* user space address? */
 	ustr = (char __user *)str;
 	if (strncpy_from_user_nofault(kstr, ustr, USTRING_BUF_SIZE) < 0)
