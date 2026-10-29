@@ -204,7 +204,15 @@ bpf_probe_read_user_common(void *dst, u32 size, const void __user *unsafe_ptr)
 {
 	int ret;
 
-	ret = copy_from_user_nofault(dst, unsafe_ptr, size);
+	/*
+	 * Tracing programs may run in any context, including kernel threads
+	 * and exiting tasks, which have no user memory to read. That's not a
+	 * kernel bug, so fail before the user copy helpers warn about it.
+	 */
+	if (unlikely(!current->mm))
+		ret = -EFAULT;
+	else
+		ret = copy_from_user_nofault(dst, unsafe_ptr, size);
 	if (unlikely(ret < 0))
 		memset(dst, 0, size);
 	return ret;
@@ -241,7 +249,11 @@ bpf_probe_read_user_str_common(void *dst, u32 size,
 	 * and keys a hash map with it, then semantically identical strings can
 	 * occupy multiple entries in the map.
 	 */
-	ret = strncpy_from_user_nofault(dst, unsafe_ptr, size);
+	/* No user memory without an mm, see bpf_probe_read_user_common(). */
+	if (unlikely(!current->mm))
+		ret = -EFAULT;
+	else
+		ret = strncpy_from_user_nofault(dst, unsafe_ptr, size);
 	if (unlikely(ret < 0))
 		memset(dst, 0, size);
 	return ret;
@@ -368,7 +380,7 @@ BPF_CALL_3(bpf_probe_write_user, void __user *, unsafe_ptr, const void *, src,
 	 * required to prevent the use of temporary mm.
 	 */
 
-	if (unlikely(in_interrupt() ||
+	if (unlikely(in_interrupt() || !current->mm ||
 		     current->flags & (PF_KTHREAD | PF_EXITING)))
 		return -EPERM;
 	if (unlikely(!nmi_uaccess_okay()))
@@ -3563,6 +3575,9 @@ static __always_inline int __bpf_dynptr_copy(const struct bpf_dynptr *dptr, u64 
 static __always_inline int copy_user_data_nofault(void *dst, const void *unsafe_src,
 						  u32 size, struct task_struct *tsk)
 {
+	/* No user memory without an mm, see bpf_probe_read_user_common(). */
+	if (unlikely(!current->mm))
+		return -EFAULT;
 	return copy_from_user_nofault(dst, (const void __user *)unsafe_src, size);
 }
 
@@ -3595,6 +3610,9 @@ static __always_inline int copy_kernel_data_nofault(void *dst, const void *unsaf
 static __always_inline int copy_user_str_nofault(void *dst, const void *unsafe_src,
 						 u32 size, struct task_struct *tsk)
 {
+	/* No user memory without an mm, see bpf_probe_read_user_common(). */
+	if (unlikely(!current->mm))
+		return -EFAULT;
 	return strncpy_from_user_nofault(dst, (const void __user *)unsafe_src, size);
 }
 

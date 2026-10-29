@@ -783,6 +783,19 @@ const struct bpf_func_proto bpf_this_cpu_ptr_proto = {
 	.arg1_type	= ARG_PTR_TO_PERCPU_BTF_ID,
 };
 
+static int bpf_trace_copy_user_string(char *buf, void __user *user_ptr,
+				      size_t bufsz)
+{
+	/*
+	 * BPF programs may run in any context, including kernel threads and
+	 * exiting tasks, which have no user memory to read. That's not a
+	 * kernel bug, so fail before the user copy helpers warn about it.
+	 */
+	if (unlikely(!current->mm))
+		return -EFAULT;
+	return strncpy_from_user_nofault(buf, user_ptr, bufsz);
+}
+
 static int bpf_trace_copy_string(char *buf, void *unsafe_ptr, char fmt_ptype,
 		size_t bufsz)
 {
@@ -794,13 +807,13 @@ static int bpf_trace_copy_string(char *buf, void *unsafe_ptr, char fmt_ptype,
 	case 's':
 #ifdef CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
 		if ((unsigned long)unsafe_ptr < TASK_SIZE)
-			return strncpy_from_user_nofault(buf, user_ptr, bufsz);
+			return bpf_trace_copy_user_string(buf, user_ptr, bufsz);
 		fallthrough;
 #endif
 	case 'k':
 		return strncpy_from_kernel_nofault(buf, unsafe_ptr, bufsz);
 	case 'u':
-		return strncpy_from_user_nofault(buf, user_ptr, bufsz);
+		return bpf_trace_copy_user_string(buf, user_ptr, bufsz);
 	}
 
 	return -EINVAL;
