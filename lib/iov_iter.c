@@ -50,6 +50,9 @@ size_t copy_from_user_iter(void __user *iter_from, size_t progress,
 	if (should_fail_usercopy())
 		return len;
 	if (can_do_masked_user_access()) {
+		/* Masking doesn't go through access_ok(), so check here. */
+		if (uaccess_without_mm())
+			return res;
 		iter_from = mask_user_address(iter_from);
 	} else {
 		if (!access_ok(iter_from, len))

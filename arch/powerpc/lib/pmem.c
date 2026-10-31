@@ -71,6 +71,8 @@ size_t copy_from_user_flushcache(void *dest, const void __user *src,
 {
 	unsigned long not_copied, start = (unsigned long) dest;
 
+	if (uaccess_without_mm())
+		return size;
 	src = mask_user_address(src);
 	not_copied = __copy_from_user(dest, src, size);
 	clean_pmem_range(start, start + size);

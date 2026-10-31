@@ -48,6 +48,8 @@ size_t copy_user_flushcache(void *dst, const void __user *src, size_t size)
 	unsigned long flushed, dest = (unsigned long) dst;
 	unsigned long rc;
 
+	if (uaccess_without_mm())
+		return size;
 	src = masked_user_access_begin(src);
 	rc = copy_to_nontemporal(dst, (__force const void *)src, size);
 	user_access_end();

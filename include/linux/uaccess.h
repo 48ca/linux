@@ -192,9 +192,12 @@ _inline_copy_from_user(void *to, const void __user *from, unsigned long n)
 	might_fault();
 	if (should_fail_usercopy())
 		goto fail;
-	if (can_do_masked_user_access())
+	if (can_do_masked_user_access()) {
+		/* Masking doesn't go through access_ok(), so check here. */
+		if (uaccess_without_mm())
+			goto fail;
 		from = mask_user_address(from);
-	else {
+	} else {
 		if (!access_ok(from, n))
 			goto fail;
 		/*
@@ -353,11 +356,14 @@ static inline __must_check unsigned long
 copy_from_user_inatomic_nontemporal(void *to, const void __user *from,
 				  unsigned long n)
 {
-	if (can_do_masked_user_access())
+	if (can_do_masked_user_access()) {
+		if (uaccess_without_mm())
+			return n;
 		from = mask_user_address(from);
-	else
+	} else {
 		if (!access_ok(from, n))
 			return n;
+	}
 	return __copy_from_user_inatomic(to, from, n);
 }
 
@@ -773,6 +779,8 @@ static __always_inline void __scoped_user_rw_access_end(const void *p)
 	typeof(uptr) __retptr;						\
 									\
 	if (can_do_masked_user_access()) {				\
+		if (uaccess_without_mm())				\
+			goto elbl;					\
 		__retptr = masked_user_##mode##_access_begin(uptr);	\
 	} else {							\
 		__retptr = uptr;					\

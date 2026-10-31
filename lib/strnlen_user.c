@@ -99,6 +99,9 @@ long strnlen_user(const char __user *str, long count)
 	if (can_do_masked_user_access()) {
 		long retval;
 
+		/* Masking doesn't go through access_ok(), so check here. */
+		if (uaccess_without_mm())
+			return 0;
 		str = masked_user_read_access_begin(str);
 		retval = do_strnlen_user(str, count, count);
 		user_read_access_end();
