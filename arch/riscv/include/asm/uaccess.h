@@ -39,7 +39,8 @@ static inline unsigned long __untagged_addr_remote(struct mm_struct *mm, unsigne
 	(__force __typeof__(addr))__untagged_addr_remote(mm, __addr);		\
 })
 
-#define access_ok(addr, size) likely(__access_ok(untagged_addr(addr), size))
+#define access_ok(addr, size) \
+	(!uaccess_without_mm() && likely(__access_ok(untagged_addr(addr), size)))
 #else
 #define untagged_addr(addr) (addr)
 #endif

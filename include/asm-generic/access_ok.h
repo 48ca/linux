@@ -41,8 +41,14 @@ static inline int __access_ok(const void __user *ptr, unsigned long size)
 }
 #endif
 
+/*
+ * access_ok() also refuses, and warns about, any user access from a task
+ * without an mm, see uaccess_without_mm() in <linux/uaccess.h>.
+ * __access_ok() is only a range check.
+ */
 #ifndef access_ok
-#define access_ok(addr, size) likely(__access_ok(addr, size))
+#define access_ok(addr, size) \
+	(!uaccess_without_mm() && likely(__access_ok(addr, size)))
 #endif
 
 #endif

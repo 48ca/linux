@@ -37,6 +37,9 @@ static inline int __access_ok(const void __user *ptr, unsigned long size);
  */
 static inline int access_ok(const void __user *addr, unsigned long size)
 {
+	if (uaccess_without_mm())
+		return 0;
+
 	/*
 	 * Asynchronous I/O running in a kernel thread does not have the
 	 * TIF_TAGGED_ADDR flag of the process owning the mm, so always untag

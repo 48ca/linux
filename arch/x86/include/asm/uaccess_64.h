@@ -203,6 +203,9 @@ static __always_inline __must_check unsigned long __clear_user(void __user *addr
 
 static __always_inline unsigned long clear_user(void __user *to, unsigned long n)
 {
+	/* access_ok() isn't defined yet here, so check for an mm explicitly. */
+	if (uaccess_without_mm())
+		return n;
 	if (__access_ok(to, n))
 		return __clear_user(to, n);
 	return n;
