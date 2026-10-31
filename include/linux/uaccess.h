@@ -33,6 +33,15 @@ static __always_inline bool uaccess_without_mm(void)
 	return WARN_ON_ONCE(!current->mm);
 }
 
+/*
+ * Return true if a user copy must not be attempted, either because the
+ * current task has no mm, or because a failure is being injected.
+ */
+static __always_inline bool uaccess_should_fail(void)
+{
+	return uaccess_without_mm() || should_fail_usercopy();
+}
+
 #include <asm/uaccess.h>
 
 /*
@@ -123,6 +132,8 @@ __copy_from_user_inatomic(void *to, const void __user *from, unsigned long n)
 {
 	unsigned long res;
 
+	if (uaccess_without_mm())
+		return n;
 	instrument_copy_from_user_before(to, from, n);
 	check_object_size(to, n, false);
 	res = raw_copy_from_user(to, from, n);
@@ -137,7 +148,7 @@ __copy_from_user(void *to, const void __user *from, unsigned long n)
 
 	might_fault();
 	instrument_copy_from_user_before(to, from, n);
-	if (should_fail_usercopy())
+	if (uaccess_should_fail())
 		return n;
 	check_object_size(to, n, false);
 	res = raw_copy_from_user(to, from, n);
@@ -161,7 +172,7 @@ __copy_from_user(void *to, const void __user *from, unsigned long n)
 static __always_inline __must_check unsigned long
 __copy_to_user_inatomic(void __user *to, const void *from, unsigned long n)
 {
-	if (should_fail_usercopy())
+	if (uaccess_should_fail())
 		return n;
 	instrument_copy_to_user(to, from, n);
 	check_object_size(from, n, true);
@@ -172,7 +183,7 @@ static __always_inline __must_check unsigned long
 __copy_to_user(void __user *to, const void *from, unsigned long n)
 {
 	might_fault();
-	if (should_fail_usercopy())
+	if (uaccess_should_fail())
 		return n;
 	instrument_copy_to_user(to, from, n);
 	check_object_size(from, n, true);

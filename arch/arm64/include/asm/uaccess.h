@@ -483,6 +483,9 @@ extern unsigned long __must_check __copy_user_flushcache(void *to, const void __
 static inline size_t copy_from_user_flushcache(void *dst, const void __user *src, size_t size)
 {
 	kasan_check_write(dst, size);
+	/* Like __copy_from_user(), this relies on an earlier access_ok(). */
+	if (uaccess_without_mm())
+		return size;
 	return __copy_user_flushcache(dst, __uaccess_mask_ptr(src), size);
 }
 #endif
