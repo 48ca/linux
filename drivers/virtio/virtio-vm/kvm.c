@@ -68,6 +68,7 @@ struct virtio_kvm_vcpu {
 	wait_queue_head_t wait;
 	bool completed;
 	int err;
+	u64 poll_ns;		/* Current adaptive polling window */
 };
 
 struct virtio_kvm_ioeventfd_link {
@@ -107,6 +108,25 @@ module_param(poll_idle_timeout_us, int, 0644);
  */
 static bool vcpu_poll = true;
 module_param(vcpu_poll, bool, 0644);
+
+/*
+ * Adaptive per-vCPU polling, used when vcpu_poll is false. After submitting
+ * KVM_RUN, the vCPU thread polls for completion for up to its current window
+ * before blocking for the notification. Like KVM halt-polling, the window
+ * grows (from vcpu_poll_start_ns, doubling) while completions arrive within
+ * vcpu_poll_max_ns, and shrinks (halving to 0) when they take longer.
+ * vcpu_poll_max_ns = 0 disables it.
+ */
+static unsigned long vcpu_poll_max_ns;
+module_param(vcpu_poll_max_ns, ulong, 0644);
+static unsigned long vcpu_poll_start_ns = 10000;
+module_param(vcpu_poll_start_ns, ulong, 0644);
+
+/* Statistics (racy, informational): polls that hit, missed, or were skipped. */
+static unsigned long vcpu_poll_hits, vcpu_poll_misses, vcpu_poll_skipped;
+module_param(vcpu_poll_hits, ulong, 0444);
+module_param(vcpu_poll_misses, ulong, 0444);
+module_param(vcpu_poll_skipped, ulong, 0444);
 
 #define VIRTKVM_MAX_MSR_ENTRIES		4096
 #define VIRTKVM_MAX_CPUID_ENTRIES	2048
@@ -553,17 +573,89 @@ static const struct file_operations kvm_stats_fops = {
 	.llseek = noop_llseek,
 };
 
+/* Marks @vcpu's KVM_RUN as completed outside the polling thread. */
+static void virtio_kvm_vcpu_complete(struct virtio_kvm_vcpu *vcpu)
+{
+	spin_lock(&vi_device->vcpu_lock);
+	list_del_init(&vcpu->active_link);
+	/* Pairs with smp_load_acquire() in virtio_kvm_vcpu_run() */
+	smp_store_release(&vcpu->completed, true);
+	spin_unlock(&vi_device->vcpu_lock);
+}
+
+/*
+ * Polls for completion of @vcpu's KVM_RUN for up to its polling window.
+ * FLAG_GUEST_POLLING is set in the state word while polling; Tachyon skips the
+ * completion notification if it observes the flag when publishing
+ * STATE_COMPLETED. Clearing the flag is a fully ordered RMW that is re-checked
+ * against the state, so a completion is either seen here or notified.
+ */
+static bool virtio_kvm_vcpu_poll(struct virtio_kvm_vcpu *vcpu,
+				 struct per_vcpu_state *state, u64 start)
+{
+	bool done = false;
+	u32 old;
+
+	do {
+		/* Pairs with the release of STATE_COMPLETED in the host */
+		if ((virt_load_acquire(&state->state) & STATE_MASK) == STATE_COMPLETED) {
+			done = true;
+			break;
+		}
+		cpu_relax();
+	} while (ktime_get_ns() - start < vcpu->poll_ns &&
+		 !need_resched() && !signal_pending(current));
+
+	old = READ_ONCE(state->state);
+	while (!try_cmpxchg(&state->state, &old, old & ~FLAG_GUEST_POLLING))
+		;
+	if ((old & STATE_MASK) == STATE_COMPLETED)
+		done = true;
+
+	if (done)
+		virtio_kvm_vcpu_complete(vcpu);
+	return done;
+}
+
+static void virtio_kvm_vcpu_adjust_poll(struct virtio_kvm_vcpu *vcpu, bool hit, u64 waited)
+{
+	u64 max = READ_ONCE(vcpu_poll_max_ns);
+	u64 start = READ_ONCE(vcpu_poll_start_ns);
+	u64 val = vcpu->poll_ns;
+
+	if (hit)
+		vcpu_poll_hits++;
+	else if (val)
+		vcpu_poll_misses++;
+	else
+		vcpu_poll_skipped++;
+
+	if (waited <= max) {
+		if (!hit)
+			val = val ? min(val * 2, max) : min(start, max);
+	} else {
+		val /= 2;
+		if (val < start)
+			val = 0;
+	}
+	vcpu->poll_ns = val;
+}
+
 static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 {
 	struct per_vcpu_state *state;
 	u32 old_s, new_s, prev;
 	u64 handle = vcpu->handle;
 	bool wake_thread = false;
+	bool adaptive, guest_poll, hit = false;
+	u64 start = 0;
 	int err;
 
 	if (mutex_lock_killable(&vcpu->mutex))
 		return -EINTR;
 
+	adaptive = !READ_ONCE(vcpu_poll) && vcpu->vm->run_notify;
+	guest_poll = adaptive && vcpu->poll_ns;
 
 	trace_virtio_vm_vcpu_run_entry(handle, vcpu->vcpu_id);
 
@@ -582,6 +674,8 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 	old_s = virt_load_acquire(&state->state);
 	for (;;) {
 		new_s = (old_s & ~STATE_MASK) | STATE_RUN_REQUESTED;
+		if (guest_poll)
+			new_s |= FLAG_GUEST_POLLING;
 		prev = cmpxchg(&state->state, old_s, new_s);
 		if (prev == old_s)
 			break;
@@ -604,8 +698,16 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 	if (wake_thread)
 		wake_up(&vi_device->vcpu_poll_wait);
 
+	if (adaptive) {
+		start = ktime_get_ns();
+		if (guest_poll)
+			hit = virtio_kvm_vcpu_poll(vcpu, state, start);
+	}
+
 	/* 3. Wait for completion */
 	err = wait_event_interruptible(vcpu->wait, smp_load_acquire(&vcpu->completed));
+	if (!err && adaptive)
+		virtio_kvm_vcpu_adjust_poll(vcpu, hit, ktime_get_ns() - start);
 	if (err == -ERESTARTSYS) {
 		struct virtkvm_cmd *int_cmd;
 		int int_err = -ENOMEM;
@@ -1968,6 +2070,7 @@ virtio_kvm_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		if (!vcpu)
 			return -ENOMEM;
 		vcpu->vcpu_id = arg;
+		vcpu->poll_ns = 0;
 		err = virtio_kvm_send_command(handle, VIRTIO_VM_IOCTL,
 					      ioctl, arg, &data);
 		if (err)

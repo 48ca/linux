@@ -17,6 +17,8 @@
 
 // Status Flags (Bits 4-7)
 #define FLAG_HOST_POLLING    0x10
+/* Set by the guest while it polls for STATE_COMPLETED itself. */
+#define FLAG_GUEST_POLLING   0x20
 
 struct per_vcpu_state {
 	u32 state;        /* Atomic field for synchronization */
