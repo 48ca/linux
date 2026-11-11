@@ -105,7 +105,7 @@ int vkvmfs_offset_to_pa(struct file *filp, u64 offset, size_t size, unsigned lon
 	return 0;
 }
 
-static int vkvmfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int vkvmfs_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 			  struct iattr *attr);
 
 static const struct inode_operations vkvmfs_file_inode_operations = {
@@ -267,7 +267,7 @@ err_fd:
 	return ret;
 }
 
-static int vkvmfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int vkvmfs_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 			  struct iattr *attr)
 {
 	unsigned int ia_valid = attr->ia_valid;
@@ -306,7 +306,7 @@ out:
 	return 0;
 }
 
-static struct inode *vkvmfs_get_inode(struct mnt_idmap *idmap,
+static struct inode *vkvmfs_get_inode(const struct mnt_idmap *idmap,
 				      struct super_block *sb,
 				      const struct inode *dir, umode_t mode,
 				      dev_t dev)
@@ -345,7 +345,7 @@ static struct inode *vkvmfs_get_inode(struct mnt_idmap *idmap,
  */
 /* SMP-safe */
 static int
-vkvmfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+vkvmfs_mknod(const struct mnt_idmap *idmap, struct inode *dir,
 	     struct dentry *dentry, umode_t mode, dev_t dev)
 {
 	struct inode * inode = vkvmfs_get_inode(idmap, dir->i_sb, dir, mode, dev);
@@ -375,7 +375,7 @@ err:
 	return error;
 }
 
-static struct dentry *vkvmfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+static struct dentry *vkvmfs_mkdir(const struct mnt_idmap *idmap, struct inode *dir,
 				 struct dentry *dentry, umode_t mode)
 {
 	int retval = vkvmfs_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
@@ -384,7 +384,7 @@ static struct dentry *vkvmfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return ERR_PTR(retval);
 }
 
-static int vkvmfs_create(struct mnt_idmap *idmap, struct inode *dir,
+static int vkvmfs_create(const struct mnt_idmap *idmap, struct inode *dir,
 			struct dentry *dentry, umode_t mode)
 {
 	return vkvmfs_mknod(idmap, dir, dentry, mode | S_IFREG, 0);
