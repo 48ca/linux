@@ -57,6 +57,7 @@ struct virtio_kvm_vm {
 	u64 shm_phys_offset;
 	size_t shm_size;
 	struct virtio_kvm_eventfd *run_notify;
+	bool polled;		/* Counted in vi_device->nr_polled_vms */
 };
 
 struct virtio_kvm_vcpu {
@@ -102,22 +103,24 @@ static int poll_idle_timeout_us = 1000;
 module_param(poll_idle_timeout_us, int, 0644);
 
 /*
- * If false, KVM_RUN completions are not busy-polled. Instead, Tachyon signals
- * a per-VM eventfd on completion and the polling thread only scans the shared
- * memory when notified. Only takes effect for VMs created afterwards.
+ * By default, each VM registers a run-completion eventfd that Tachyon signals
+ * when a vCPU finishes KVM_RUN, and the polling thread only scans the shared
+ * memory when notified. If vcpu_poll is true, or if the host does not support
+ * the notification, the VM instead relies on the polling thread busy-polling
+ * while any of its vCPUs is in KVM_RUN. Only affects VMs created afterwards.
  */
-static bool vcpu_poll = true;
+static bool vcpu_poll;
 module_param(vcpu_poll, bool, 0644);
 
 /*
- * Adaptive per-vCPU polling, used when vcpu_poll is false. After submitting
- * KVM_RUN, the vCPU thread polls for completion for up to its current window
- * before blocking for the notification. Like KVM halt-polling, the window
- * grows (from vcpu_poll_start_ns, doubling) while completions arrive within
- * vcpu_poll_max_ns, and shrinks (halving to 0) when they take longer.
- * vcpu_poll_max_ns = 0 disables it.
+ * Adaptive per-vCPU polling for VMs with a run-completion notifier. After
+ * submitting KVM_RUN, the vCPU thread polls for completion for up to its
+ * current window before blocking for the notification. Like KVM halt-polling,
+ * the window grows (from vcpu_poll_start_ns, doubling) while completions
+ * arrive within vcpu_poll_max_ns, and shrinks (halving to 0) when they take
+ * longer. vcpu_poll_max_ns = 0 disables it.
  */
-static unsigned long vcpu_poll_max_ns;
+static unsigned long vcpu_poll_max_ns = 200000;
 module_param(vcpu_poll_max_ns, ulong, 0644);
 static unsigned long vcpu_poll_start_ns = 10000;
 module_param(vcpu_poll_start_ns, ulong, 0644);
@@ -654,7 +657,7 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 	if (mutex_lock_killable(&vcpu->mutex))
 		return -EINTR;
 
-	adaptive = !READ_ONCE(vcpu_poll) && vcpu->vm->run_notify;
+	adaptive = vcpu->vm->run_notify;
 	guest_poll = adaptive && vcpu->poll_ns;
 
 	trace_virtio_vm_vcpu_run_entry(handle, vcpu->vcpu_id);
@@ -2233,6 +2236,8 @@ virtio_kvm_vm_release(struct inode *inode, struct file *filp)
 
 	if (vm->run_notify)
 		virtio_kvm_put_evfd(vm->run_notify);
+	if (vm->polled)
+		atomic_dec(&vi_device->nr_polled_vms);
 
 	if (vm->shm) {
 		memunmap(vm->shm);
@@ -2342,6 +2347,7 @@ init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp,
 	vm->file = filp;
 	vm->shm = NULL;
 	vm->run_notify = NULL;
+	vm->polled = false;
 }
 
 static long
@@ -2436,8 +2442,14 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		}
 		init_vm(vm, data, file, part, partition_id);
 		err = virtio_kvm_vm_setup_shm(vm);
-		if (!err && !READ_ONCE(vcpu_poll))
-			err = virtio_kvm_vm_setup_run_notify(vm);
+		if (!err && !READ_ONCE(vcpu_poll) &&
+		    virtio_kvm_vm_setup_run_notify(vm))
+			pr_warn_once("no run-completion notification, falling back to polling\n");
+		if (!err && !vm->run_notify) {
+			vm->polled = true;
+			if (atomic_inc_return(&vi_device->nr_polled_vms) == 1)
+				wake_up(&vi_device->vcpu_poll_wait);
+		}
 		if (err) {
 			fput(file);
 			put_unused_fd(fd);
@@ -2503,9 +2515,11 @@ static int vcpu_polling_thread(void *data)
 	while (!kthread_should_stop()) {
 		bool empty;
 
-		if (!READ_ONCE(vcpu_poll)) {
+		/* Only busy-poll on behalf of VMs without a notifier. */
+		if (!atomic_read(&vi->nr_polled_vms)) {
 			wait_event_interruptible(vi->vcpu_poll_wait,
 				atomic_xchg(&vi->vcpu_scan_pending, 0) ||
+				atomic_read(&vi->nr_polled_vms) ||
 				kthread_should_stop());
 			vcpu_poll_scan(vi);
 			continue;

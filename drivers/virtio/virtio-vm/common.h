@@ -130,6 +130,7 @@ struct virtkvm_info {
 	struct list_head active_vcpus;
 	wait_queue_head_t vcpu_poll_wait;
 	atomic_t vcpu_scan_pending;
+	atomic_t nr_polled_vms;		/* VMs without a run-completion notifier */
 	struct task_struct *polling_thread;
 	wait_queue_head_t vq_wait;
 	bool vq_full;
