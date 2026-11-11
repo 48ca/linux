@@ -22,6 +22,7 @@
 #define VIRTIO_VM_EVENTFD_POLL		(11)
 #define VIRTIO_VM_FILE_IO		(12)
 #define VIRTIO_VM_READY			(13)
+#define VIRTIO_VM_SET_RUN_NOTIFY	(14)
 #define VIRTIO_VM_VFIO_OPEN		(64)
 #define VIRTIO_VM_VFIO_GROUP_OPEN	(65)
 #define VIRTIO_VM_VFIO_DEVICE_READ	(66)
@@ -92,6 +93,9 @@ struct virtio_kvm_eventfd {
 	struct virtio_kvm_partition *part;
 	u64 handle;	/* L0 handle */
 	u32 id;		/* L1 synthetic ID */
+	/* If set, called on signal instead of signalling ctx (ctx is NULL). */
+	void (*notify)(struct virtio_kvm_eventfd *evfd);
+	void *priv;
 	refcount_t refcnt;
 	struct rcu_head rcu;
 };
@@ -125,6 +129,7 @@ struct virtkvm_info {
 	spinlock_t vcpu_lock;
 	struct list_head active_vcpus;
 	wait_queue_head_t vcpu_poll_wait;
+	atomic_t vcpu_scan_pending;
 	struct task_struct *polling_thread;
 	wait_queue_head_t vq_wait;
 	bool vq_full;
@@ -212,5 +217,9 @@ long send_dev_munmap(u64 handle, unsigned long phys_offset, unsigned long size);
 
 struct virtio_kvm_eventfd *virtio_kvm_get_evfd(u64 partition_id, struct eventfd_ctx *ctx);
 void virtio_kvm_put_evfd(struct virtio_kvm_eventfd *evfd);
+struct virtio_kvm_eventfd *
+virtio_kvm_get_notify_evfd(u64 partition_id,
+			   void (*notify)(struct virtio_kvm_eventfd *evfd),
+			   void *priv);
 
 #endif /* __VIRTIO_VM_COMMON_H */

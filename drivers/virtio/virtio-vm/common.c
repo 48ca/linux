@@ -132,6 +132,10 @@ void virtio_kvm_eventfd_poll_done(struct virtio_kvm_poll *poll)
 			evfd = xa_load(&vi_device->ioeventfds, handle);
 			if (!evfd)	/* Race w/ close */
 				continue;
+			if (evfd->notify) {
+				evfd->notify(evfd);
+				continue;
+			}
 			val = min_t(u64, le64_to_cpu(poll->vals[i]), 4096);
 			for (j = 0; j < val; j++) {
 				trace_virtio_vm_ioeventfd_signal(evfd->handle, evfd->id);
@@ -744,7 +748,8 @@ static void virtio_kvm_evfd_rcu_free(struct rcu_head *rcu)
 	struct virtio_kvm_eventfd *evfd = container_of(rcu, struct virtio_kvm_eventfd, rcu);
 
 	virtkvm_partition_put(evfd->part);
-	eventfd_ctx_put(evfd->ctx);
+	if (evfd->ctx)
+		eventfd_ctx_put(evfd->ctx);
 	kfree(evfd);
 }
 
@@ -834,6 +839,60 @@ struct virtio_kvm_eventfd *virtio_kvm_get_evfd(u64 partition_id, struct eventfd_
 	queue_work(eventfd_cleanup_wq, &vi_device->poll_refill);
 
 	return new_evfd;
+}
+
+/*
+ * Registers an L0 eventfd whose signals invoke @notify (from the virtqueue
+ * completion path) instead of signalling an L1 eventfd. Release it with
+ * virtio_kvm_put_evfd().
+ */
+struct virtio_kvm_eventfd *
+virtio_kvm_get_notify_evfd(u64 partition_id,
+			   void (*notify)(struct virtio_kvm_eventfd *evfd),
+			   void *priv)
+{
+	struct virtio_kvm_eventfd *evfd;
+	u64 handle = -1ULL;
+	int ret, id;
+
+	evfd = kzalloc(sizeof(*evfd), GFP_KERNEL);
+	if (!evfd)
+		return ERR_PTR(-ENOMEM);
+
+	id = ida_alloc(&vi_device->evfd_ida, GFP_KERNEL);
+	if (id < 0) {
+		kfree(evfd);
+		return ERR_PTR(id);
+	}
+
+	evfd->id = id;
+	evfd->notify = notify;
+	evfd->priv = priv;
+	evfd->partition_id = partition_id;
+	evfd->part = virtkvm_partition_get_by_id(vi_device, partition_id);
+	refcount_set(&evfd->refcnt, 1);
+
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_GET, partition_id,
+				      (u64)id, &handle);
+	if (ret)
+		goto err_free;
+	evfd->handle = handle;
+
+	ret = xa_insert(&vi_device->ioeventfds, handle, evfd, GFP_KERNEL);
+	if (ret) {
+		virtio_kvm_send_command(-1, VIRTIO_VM_EVENTFD_PUT, partition_id,
+					handle, NULL);
+		goto err_free;
+	}
+
+	queue_work(eventfd_cleanup_wq, &vi_device->poll_refill);
+	return evfd;
+
+err_free:
+	virtkvm_partition_put(evfd->part);
+	ida_free(&vi_device->evfd_ida, id);
+	kfree(evfd);
+	return ERR_PTR(ret);
 }
 
 void virtio_kvm_put_evfd(struct virtio_kvm_eventfd *evfd)

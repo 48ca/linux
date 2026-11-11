@@ -56,6 +56,7 @@ struct virtio_kvm_vm {
 	struct vcpu_shared_memory *shm;
 	u64 shm_phys_offset;
 	size_t shm_size;
+	struct virtio_kvm_eventfd *run_notify;
 };
 
 struct virtio_kvm_vcpu {
@@ -98,6 +99,14 @@ static int virtio_kvm_ioeventfd_deassign(struct virtio_kvm_vm *vm,
 
 static int poll_idle_timeout_us = 1000;
 module_param(poll_idle_timeout_us, int, 0644);
+
+/*
+ * If false, KVM_RUN completions are not busy-polled. Instead, Tachyon signals
+ * a per-VM eventfd on completion and the polling thread only scans the shared
+ * memory when notified. Only takes effect for VMs created afterwards.
+ */
+static bool vcpu_poll = true;
+module_param(vcpu_poll, bool, 0644);
 
 #define VIRTKVM_MAX_MSR_ENTRIES		4096
 #define VIRTKVM_MAX_CPUID_ENTRIES	2048
@@ -554,6 +563,7 @@ static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
 
 	if (mutex_lock_killable(&vcpu->mutex))
 		return -EINTR;
+
 
 	trace_virtio_vm_vcpu_run_entry(handle, vcpu->vcpu_id);
 
@@ -2118,6 +2128,9 @@ virtio_kvm_vm_release(struct inode *inode, struct file *filp)
 	spin_unlock_irq(&vm->fd_lock);
 	flush_workqueue(eventfd_cleanup_wq);
 
+	if (vm->run_notify)
+		virtio_kvm_put_evfd(vm->run_notify);
+
 	if (vm->shm) {
 		memunmap(vm->shm);
 		send_dev_munmap(handle, vm->shm_phys_offset, vm->shm_size);
@@ -2184,6 +2197,32 @@ static int virtio_kvm_vm_setup_shm(struct virtio_kvm_vm *vm)
 	return 0;
 }
 
+static void virtio_kvm_run_notify(struct virtio_kvm_eventfd *evfd)
+{
+	atomic_set(&vi_device->vcpu_scan_pending, 1);
+	wake_up(&vi_device->vcpu_poll_wait);
+}
+
+/* Asks Tachyon to signal an eventfd whenever a vCPU of @vm completes KVM_RUN. */
+static int virtio_kvm_vm_setup_run_notify(struct virtio_kvm_vm *vm)
+{
+	struct virtio_kvm_eventfd *evfd;
+	int err;
+
+	evfd = virtio_kvm_get_notify_evfd(vm->partition_id, virtio_kvm_run_notify, vm);
+	if (IS_ERR(evfd))
+		return PTR_ERR(evfd);
+
+	err = virtio_kvm_send_command(vm->handle, VIRTIO_VM_SET_RUN_NOTIFY,
+				      evfd->handle, 0, NULL);
+	if (err) {
+		virtio_kvm_put_evfd(evfd);
+		return err;
+	}
+	vm->run_notify = evfd;
+	return 0;
+}
+
 static void
 init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp,
 	struct virtio_kvm_partition *part, u64 partition_id)
@@ -2199,6 +2238,7 @@ init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp,
 	spin_lock_init(&vm->fd_lock);
 	vm->file = filp;
 	vm->shm = NULL;
+	vm->run_notify = NULL;
 }
 
 static long
@@ -2293,6 +2333,8 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 		}
 		init_vm(vm, data, file, part, partition_id);
 		err = virtio_kvm_vm_setup_shm(vm);
+		if (!err && !READ_ONCE(vcpu_poll))
+			err = virtio_kvm_vm_setup_run_notify(vm);
 		if (err) {
 			fput(file);
 			put_unused_fd(fd);
@@ -2317,54 +2359,68 @@ virtio_kvm_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
  * system. The design should be improved to maintain a list of only actively
  * vCPUs.
  */
+/* Completes every active vCPU whose KVM_RUN finished. Returns true if none are active. */
+static bool vcpu_poll_scan(struct virtkvm_info *vi)
+{
+	struct virtio_kvm_vcpu *vcpu, *tmp;
+	struct per_vcpu_state *state;
+	bool empty;
+
+	spin_lock(&vi->vcpu_lock);
+	empty = list_empty(&vi->active_vcpus);
+	list_for_each_entry_safe(vcpu, tmp, &vi->active_vcpus, active_link) {
+		state = &vcpu->vm->shm->vcpus[vcpu->vcpu_id];
+
+		if (!READ_ONCE(vcpu->completed)) {
+			/* Pair with virt_store_release() in host */
+			u32 s = virt_load_acquire(&state->state);
+
+			if ((s & STATE_MASK) != STATE_COMPLETED)
+				continue;
+
+			list_del_init(&vcpu->active_link);
+			/* Pairs with smp_load_acquire() in virtio_kvm_vcpu_run() */
+			smp_store_release(&vcpu->completed, true);
+			wake_up(&vcpu->wait);
+		} else {
+			/* Should not be in active list if completed */
+			list_del_init(&vcpu->active_link);
+		}
+	}
+	spin_unlock(&vi->vcpu_lock);
+
+	return empty;
+}
+
 static int vcpu_polling_thread(void *data)
 {
 	struct virtkvm_info *vi = data;
-	struct virtio_kvm_vcpu *vcpu, *tmp;
-	struct per_vcpu_state *state;
 	ktime_t idle_since = 0;
 
 	while (!kthread_should_stop()) {
 		bool empty;
 
-		spin_lock(&vi->vcpu_lock);
-		empty = list_empty(&vi->active_vcpus);
+		if (!READ_ONCE(vcpu_poll)) {
+			wait_event_interruptible(vi->vcpu_poll_wait,
+				atomic_xchg(&vi->vcpu_scan_pending, 0) ||
+				kthread_should_stop());
+			vcpu_poll_scan(vi);
+			continue;
+		}
+
+		empty = vcpu_poll_scan(vi);
 		if (!empty) {
 			idle_since = 0;
-			list_for_each_entry_safe(vcpu, tmp, &vi->active_vcpus, active_link) {
-
-				state = &vcpu->vm->shm->vcpus[vcpu->vcpu_id];
-
-				if (!READ_ONCE(vcpu->completed)) {
-					/* Pair with virt_store_release() in host */
-					u32 s = virt_load_acquire(&state->state);
-
-					if ((s & STATE_MASK) != STATE_COMPLETED)
-						continue;
-
-					list_del_init(&vcpu->active_link);
-					smp_store_release(&vcpu->completed, true);
-					wake_up(&vcpu->wait);
-				} else {
-					/* Should not be in active list if completed */
-					list_del_init(&vcpu->active_link);
-				}
-			}
-		}
-		spin_unlock(&vi->vcpu_lock);
-
-		if (empty) {
-			if (idle_since == 0) {
-				idle_since = ktime_get();
-			} else if (ktime_us_delta(ktime_get(), idle_since) >= poll_idle_timeout_us) {
-				/* Suspend polling */
-				trace_virtio_vm_poll_stop(true);
-				wait_event_interruptible(vi->vcpu_poll_wait,
-					!list_empty(&vi->active_vcpus) || kthread_should_stop());
-				trace_virtio_vm_poll_start(true);
-				idle_since = 0;
-				continue;
-			}
+		} else if (idle_since == 0) {
+			idle_since = ktime_get();
+		} else if (ktime_us_delta(ktime_get(), idle_since) >= poll_idle_timeout_us) {
+			/* Suspend polling */
+			trace_virtio_vm_poll_stop(true);
+			wait_event_interruptible(vi->vcpu_poll_wait,
+				!list_empty(&vi->active_vcpus) || kthread_should_stop());
+			trace_virtio_vm_poll_start(true);
+			idle_since = 0;
+			continue;
 		}
 
 		cond_resched();
