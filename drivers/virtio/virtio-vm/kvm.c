@@ -724,16 +724,19 @@ static const struct mmu_interval_notifier_ops virtio_kvm_l1_mni_ops = {
 	.invalidate = virtio_kvm_l1_slot_invalidate,
 };
 
+#define L1_FAULT_PREFETCH_PAGES 64
+
 static int virtio_kvm_fault_l1_slot(struct virtio_kvm_l1_slot *s, u64 gpa)
 {
 	u64 idx = (gpa - s->guest_phys_addr) >> PAGE_SHIFT;
+	u64 total_pages = s->memory_size >> PAGE_SHIFT;
 	unsigned long hva = s->userspace_addr + (idx << PAGE_SHIFT);
 	bool writable = !(s->flags & KVM_MEM_READONLY);
 	unsigned int gup_flags = writable ? FOLL_WRITE : 0;
-	struct page *page = NULL;
+	struct page *pages[L1_FAULT_PREFETCH_PAGES];
+	u64 nr = min_t(u64, L1_FAULT_PREFETCH_PAGES, total_pages - idx);
 	unsigned long seq;
-	long npages;
-	u64 entry;
+	long npages, i;
 
 	if (READ_ONCE(s->table[idx]) & TACHYON_MEM_PTE_PRESENT)
 		return 0;
@@ -741,28 +744,33 @@ static int virtio_kvm_fault_l1_slot(struct virtio_kvm_l1_slot *s, u64 gpa)
 	for (;;) {
 		seq = mmu_interval_read_begin(&s->mni);
 		mmap_read_lock(s->mm);
-		npages = get_user_pages_remote(s->mm, hva, 1, gup_flags,
-					       &page, NULL);
-		if (npages != 1 && writable) {
+		npages = get_user_pages_remote(s->mm, hva, nr, gup_flags,
+					       pages, NULL);
+		if (npages <= 0 && writable) {
 			writable = false;
 			npages = get_user_pages_remote(s->mm, hva, 1, 0,
-						       &page, NULL);
+						       pages, NULL);
 		}
 		mmap_read_unlock(s->mm);
-		if (npages != 1)
+		if (npages <= 0)
 			return npages < 0 ? (int)npages : -EFAULT;
 
-		entry = ((u64)page_to_pfn(page) << PAGE_SHIFT) |
-			TACHYON_MEM_PTE_PRESENT |
-			(writable ? TACHYON_MEM_PTE_WRITABLE : 0);
-		put_page(page);
-
 		if (!mmu_interval_read_retry(&s->mni, seq)) {
-			WRITE_ONCE(s->table[idx], entry);
-			/* Ensure PTE is visible before re-entering KVM_RUN. */
+			for (i = 0; i < npages; i++) {
+				u64 entry = ((u64)page_to_pfn(pages[i]) << PAGE_SHIFT) |
+					    TACHYON_MEM_PTE_PRESENT |
+					    (writable ? TACHYON_MEM_PTE_WRITABLE : 0);
+
+				if (!(READ_ONCE(s->table[idx + i]) & TACHYON_MEM_PTE_PRESENT))
+					WRITE_ONCE(s->table[idx + i], entry);
+				put_page(pages[i]);
+			}
+			/* Ensure PTEs are visible before re-entering KVM_RUN. */
 			smp_wmb();
 			return 0;
 		}
+		for (i = 0; i < npages; i++)
+			put_page(pages[i]);
 	}
 }
 
