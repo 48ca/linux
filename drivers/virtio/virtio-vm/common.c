@@ -159,6 +159,13 @@ static void kvm_request_done(struct virtkvm_cmd *cmd)
 	case VIRTIO_VM_EVENTFD_POLL:
 		virtio_kvm_eventfd_poll_done(&buf->poll);
 		break;
+	case VIRTIO_VM_L1_FAULT_POLL:
+		atomic_set(&vi_device->l1_fault_poll_active, 0);
+		if (le64_to_cpu(buf->resp.status) == 0 && eventfd_cleanup_wq) {
+			vi_device->l1_fault_pending = true;
+			queue_work(eventfd_cleanup_wq, &vi_device->l1_fault_work);
+		}
+		break;
 	default:
 		complete(&cmd->acked);
 		break;
@@ -743,6 +750,31 @@ static void refill_work(struct work_struct *work)
 	WARN_ON(ret != 0);
 }
 
+static void l1_fault_work_fn(struct work_struct *work)
+{
+	struct virtkvm_info *vi =
+		container_of(work, struct virtkvm_info, l1_fault_work);
+	struct virtio_kvm_l1_fault f;
+	int ret;
+
+	if (vi->l1_fault_pending) {
+		f = *vi->l1_fault_buf;
+		virtio_kvm_handle_l1_fault_by_handle(le64_to_cpu(f.vm_handle),
+						     le64_to_cpu(f.gpa));
+		virtio_kvm_send_command(-1, VIRTIO_VM_L1_FAULT_ACK,
+					le64_to_cpu(f.seq), 0, NULL);
+		vi->l1_fault_pending = false;
+	}
+
+	if (atomic_cmpxchg_relaxed(&vi->l1_fault_poll_active, 0, 1))
+		return;
+
+	ret = virtio_kvm_send_command_async(-1, VIRTIO_VM_L1_FAULT_POLL, 0,
+					    __pa(vi->l1_fault_buf), NULL);
+	if (ret)
+		atomic_set(&vi->l1_fault_poll_active, 0);
+}
+
 static void virtio_kvm_evfd_rcu_free(struct rcu_head *rcu)
 {
 	struct virtio_kvm_eventfd *evfd = container_of(rcu, struct virtio_kvm_eventfd, rcu);
@@ -1131,6 +1163,12 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	ida_init(&vi->evfd_ida);
 	spin_lock_init(&vi->evfd_lock);
 	INIT_WORK(&vi->poll_refill, refill_work);
+	INIT_WORK(&vi->l1_fault_work, l1_fault_work_fn);
+	vi->l1_fault_buf = kzalloc(sizeof(*vi->l1_fault_buf), GFP_KERNEL);
+	if (!vi->l1_fault_buf) {
+		err = -ENOMEM;
+		goto err_del_vqs;
+	}
 	spin_lock_init(&vi->virtkvm_lock);
 
 	INIT_LIST_HEAD(&vi->partitions);
@@ -1152,6 +1190,7 @@ static int virtio_vm_init(struct virtio_device *vdev)
 
 	vi_device = vi;
 	virtio_device_ready(vdev);
+	queue_work(eventfd_cleanup_wq, &vi->l1_fault_work);
 
 	err = misc_register(&tachyon_ctrl_dev);
 	if (err)
@@ -1200,6 +1239,7 @@ static void remove_common(struct virtio_device *vdev)
 
 	mtree_destroy(&vi->allocinfo.mt);
 	ida_destroy(&vi->evfd_ida);
+	kfree(vi->l1_fault_buf);
 	vi_device = NULL;
 	kfree(vi);
 }

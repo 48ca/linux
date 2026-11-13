@@ -20,6 +20,10 @@
 /* Set by the guest while it polls for STATE_COMPLETED itself. */
 #define FLAG_GUEST_POLLING   0x20
 
+#define TACHYON_MEM_PTE_PRESENT		(1ULL << 0)
+#define TACHYON_MEM_PTE_WRITABLE	(1ULL << 1)
+#define TACHYON_MEM_PFN_MASK		(((1ULL << 52) - 1) & ~((1ULL << 12) - 1))
+
 struct per_vcpu_state {
 	u32 state;        /* Atomic field for synchronization */
 	s32 status;       /* Return code from KVM_RUN */

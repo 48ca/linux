@@ -255,6 +255,7 @@ endif # VIRTIO_RTC
 config VIRTIO_VM
 	tristate "virtio-vm"
 	depends on VIRTIO && VIRTIO_PCI && X86_64
+	select MMU_NOTIFIER
 	# This module conflicts with module parameters from KVM. They should
 	# not both be built together.
 	depends on !KVM_COMMON

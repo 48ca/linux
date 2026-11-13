@@ -13,6 +13,8 @@
 #include <linux/anon_inodes.h>
 #include <linux/mm.h>
 #include <linux/poll.h>
+#include <linux/mmu_notifier.h>
+#include <linux/sched/mm.h>
 #include <linux/refcount.h>
 #include <linux/idr.h>
 #include <linux/sched/signal.h>
@@ -44,8 +46,11 @@ struct virtio_kvm_vm {
 	u64 handle;
 	u64 partition_id;
 	struct virtio_kvm_partition *part;
+	struct list_head l1_vm_link;
 	struct mutex region_lock;
 	struct list_head memory_regions;
+	struct mutex l1_slot_lock;
+	struct list_head l1_slots;
 
 	spinlock_t fd_lock;
 	struct vhost_task *irqfd_thread;
@@ -70,6 +75,23 @@ struct virtio_kvm_vcpu {
 	bool completed;
 	int err;
 	u64 poll_ns;		/* Current adaptive polling window */
+	struct kvm_run *run;
+};
+
+struct virtio_kvm_l1_slot {
+	struct list_head link;
+	struct virtio_kvm_vm *vm;
+	u32 slot;
+	u32 flags;
+	u64 guest_phys_addr;
+	u64 memory_size;
+	u64 userspace_addr;
+	struct mm_struct *mm;
+	struct mmu_interval_notifier mni;
+	u64 *table;
+	u64 table_handle;
+	u64 table_phys_offset;
+	u64 table_size;
 };
 
 struct virtio_kvm_ioeventfd_link {
@@ -543,8 +565,16 @@ static int
 virtio_kvm_vcpu_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct virtio_kvm_vcpu *vcpu = filp->private_data;
+	int ret;
 
-	return virtio_kvm_generic_mmap(vcpu->handle, vma, &vcpu_vm_ops);
+	ret = virtio_kvm_generic_mmap(vcpu->handle, vma, &vcpu_vm_ops);
+	if (!ret && !vma->vm_pgoff && !vcpu->run) {
+		struct virtio_vm_mmap_region *region = vma->vm_private_data;
+
+		vcpu->run = memremap(vi_device->phys_start + region->phys_offset,
+				     PAGE_SIZE, MEMREMAP_WB);
+	}
+	return ret;
 }
 
 static int
@@ -642,6 +672,136 @@ static void virtio_kvm_vcpu_adjust_poll(struct virtio_kvm_vcpu *vcpu, bool hit, 
 			val = 0;
 	}
 	vcpu->poll_ns = val;
+}
+
+static bool virtio_kvm_l1_slot_invalidate(struct mmu_interval_notifier *mni,
+					  const struct mmu_notifier_range *range,
+					  unsigned long cur_seq)
+{
+	struct virtio_kvm_l1_slot *s = container_of(mni, struct virtio_kvm_l1_slot, mni);
+	struct virtio_kvm_l1_inv_req {
+		__le32 slot;
+		__le32 pad;
+		__le64 offset;
+		__le64 size;
+	} __packed;
+	struct virtio_kvm_l1_inv_req *req;
+	unsigned long start, end, idx_start, idx_end, i;
+	int ret;
+
+	if (!mmu_notifier_range_blockable(range))
+		return false;
+
+	mmu_interval_set_seq(mni, cur_seq);
+
+	start = max_t(unsigned long, range->start, s->userspace_addr);
+	end = min_t(unsigned long, range->end, s->userspace_addr + s->memory_size);
+	if (start >= end)
+		return true;
+
+	idx_start = (start - s->userspace_addr) >> PAGE_SHIFT;
+	idx_end = DIV_ROUND_UP(end - s->userspace_addr, PAGE_SIZE);
+	for (i = idx_start; i < idx_end; i++)
+		WRITE_ONCE(s->table[i], 0);
+	/* Ensure cleared PTEs are visible to L0 before invalidation RPC. */
+	smp_wmb();
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return true;
+	req->slot = cpu_to_le32(s->slot);
+	req->offset = cpu_to_le64(idx_start << PAGE_SHIFT);
+	req->size = cpu_to_le64((idx_end - idx_start) << PAGE_SHIFT);
+
+	ret = virtio_kvm_send_command(s->vm->handle, VIRTIO_VM_INVALIDATE_L1_MEMSLOT,
+				      0, __pa(req), NULL);
+	WARN_ON_ONCE(ret);
+	kfree(req);
+	return true;
+}
+
+static const struct mmu_interval_notifier_ops virtio_kvm_l1_mni_ops = {
+	.invalidate = virtio_kvm_l1_slot_invalidate,
+};
+
+static int virtio_kvm_fault_l1_slot(struct virtio_kvm_l1_slot *s, u64 gpa)
+{
+	u64 idx = (gpa - s->guest_phys_addr) >> PAGE_SHIFT;
+	unsigned long hva = s->userspace_addr + (idx << PAGE_SHIFT);
+	bool writable = !(s->flags & KVM_MEM_READONLY);
+	unsigned int gup_flags = writable ? FOLL_WRITE : 0;
+	struct page *page = NULL;
+	unsigned long seq;
+	long npages;
+	u64 entry;
+
+	if (READ_ONCE(s->table[idx]) & TACHYON_MEM_PTE_PRESENT)
+		return 0;
+
+	for (;;) {
+		seq = mmu_interval_read_begin(&s->mni);
+		mmap_read_lock(s->mm);
+		npages = get_user_pages_remote(s->mm, hva, 1, gup_flags,
+					       &page, NULL);
+		if (npages != 1 && writable) {
+			writable = false;
+			npages = get_user_pages_remote(s->mm, hva, 1, 0,
+						       &page, NULL);
+		}
+		mmap_read_unlock(s->mm);
+		if (npages != 1)
+			return npages < 0 ? (int)npages : -EFAULT;
+
+		entry = ((u64)page_to_pfn(page) << PAGE_SHIFT) |
+			TACHYON_MEM_PTE_PRESENT |
+			(writable ? TACHYON_MEM_PTE_WRITABLE : 0);
+		put_page(page);
+
+		if (!mmu_interval_read_retry(&s->mni, seq)) {
+			WRITE_ONCE(s->table[idx], entry);
+			/* Ensure PTE is visible before re-entering KVM_RUN. */
+			smp_wmb();
+			return 0;
+		}
+	}
+}
+
+static DEFINE_MUTEX(l1_vm_list_lock);
+static LIST_HEAD(l1_vm_list);
+
+static int virtio_kvm_handle_l1_fault(struct virtio_kvm_vm *vm, u64 gpa)
+{
+	struct virtio_kvm_l1_slot *s;
+	bool found = false;
+	int ret = 0;
+
+	mutex_lock(&vm->l1_slot_lock);
+	list_for_each_entry(s, &vm->l1_slots, link) {
+		if (gpa >= s->guest_phys_addr &&
+		    gpa < s->guest_phys_addr + s->memory_size) {
+			int r = virtio_kvm_fault_l1_slot(s, gpa);
+
+			found = true;
+			if (r && !ret)
+				ret = r;
+		}
+	}
+	mutex_unlock(&vm->l1_slot_lock);
+	return found ? ret : -ENOENT;
+}
+
+void virtio_kvm_handle_l1_fault_by_handle(u64 vm_handle, u64 gpa)
+{
+	struct virtio_kvm_vm *vm;
+
+	mutex_lock(&l1_vm_list_lock);
+	list_for_each_entry(vm, &l1_vm_list, l1_vm_link) {
+		if (vm->handle == vm_handle) {
+			virtio_kvm_handle_l1_fault(vm, gpa);
+			break;
+		}
+	}
+	mutex_unlock(&l1_vm_list_lock);
 }
 
 static int virtio_kvm_vcpu_run(struct virtio_kvm_vcpu *vcpu)
@@ -902,6 +1062,9 @@ virtio_kvm_vcpu_release(struct inode *inode, struct file *filp)
 	WARN_ONCE(ret, "Failed to start releasing vcpu %llx: %d\n",
 			vcpu->handle, ret);
 
+	if (vcpu->run)
+		memunmap(vcpu->run);
+
 	fput(vcpu->vm->file);
 
 	kfree(vcpu);
@@ -1019,6 +1182,171 @@ update_mem_regions(struct virtio_kvm_vm *vm,
 	mutex_unlock(&vm->region_lock);
 }
 
+static void virtio_kvm_destroy_l1_slot(struct virtio_kvm_l1_slot *s)
+{
+	mmu_interval_notifier_remove(&s->mni);
+	mmdrop(s->mm);
+	if (s->table)
+		memunmap(s->table);
+	if (s->table_handle) {
+		virtio_kvm_send_command(s->table_handle,
+					VIRTIO_VM_MEMORY_FILE_DELETE,
+					0, 0, NULL);
+		virtio_vm_put_unused_phys_offset(s->table_phys_offset, s->table_size);
+	}
+	kfree(s);
+}
+
+static long
+virtio_kvm_set_l1_memslot(struct virtio_kvm_vm *vm,
+			  const struct kvm_userspace_memory_region2 *reg)
+{
+	struct virtio_kvm_l1_memslot_req {
+		__le32 slot;
+		__le32 flags;
+		__le64 guest_phys_addr;
+		__le64 memory_size;
+		__le64 table_bar_gpa;
+		__le64 table_size;
+	} __packed;
+	struct virtio_kvm_l1_memslot_req *mreq;
+	struct {
+		u64 size;
+		u64 phys_offset;
+		u64 handle;
+	} *fcreate;
+	struct virtio_kvm_l1_slot *s, *existing = NULL;
+	int ret;
+
+	mutex_lock(&vm->l1_slot_lock);
+	list_for_each_entry(s, &vm->l1_slots, link) {
+		if (s->slot == reg->slot) {
+			existing = s;
+			break;
+		}
+	}
+
+	if (reg->memory_size == 0) {
+		if (!existing) {
+			mutex_unlock(&vm->l1_slot_lock);
+			return -ENOENT;
+		}
+		mreq = kzalloc(sizeof(*mreq), GFP_KERNEL);
+		if (!mreq) {
+			mutex_unlock(&vm->l1_slot_lock);
+			return -ENOMEM;
+		}
+		mreq->slot = cpu_to_le32(reg->slot);
+		mreq->flags = cpu_to_le32(reg->flags);
+		mreq->guest_phys_addr = cpu_to_le64(reg->guest_phys_addr);
+		ret = virtio_kvm_send_command(vm->handle, VIRTIO_VM_SET_L1_MEMSLOT,
+					      0, __pa(mreq), NULL);
+		kfree(mreq);
+		if (!ret) {
+			list_del(&existing->link);
+			virtio_kvm_destroy_l1_slot(existing);
+		}
+		mutex_unlock(&vm->l1_slot_lock);
+		return ret;
+	}
+
+	if (existing) {
+		mutex_unlock(&vm->l1_slot_lock);
+		return -EEXIST;
+	}
+	if (!PAGE_ALIGNED(reg->guest_phys_addr) ||
+	    !PAGE_ALIGNED(reg->memory_size) ||
+	    !PAGE_ALIGNED(reg->userspace_addr)) {
+		mutex_unlock(&vm->l1_slot_lock);
+		return -EINVAL;
+	}
+
+	s = kzalloc(sizeof(*s), GFP_KERNEL);
+	if (!s) {
+		mutex_unlock(&vm->l1_slot_lock);
+		return -ENOMEM;
+	}
+	s->vm = vm;
+	s->slot = reg->slot;
+	s->flags = reg->flags;
+	s->guest_phys_addr = reg->guest_phys_addr;
+	s->memory_size = reg->memory_size;
+	s->userspace_addr = reg->userspace_addr;
+	s->table_size = PAGE_ALIGN((reg->memory_size >> PAGE_SHIFT) * sizeof(u64));
+
+	s->table_phys_offset = virtio_vm_get_unused_phys_offset(s->table_size, PAGE_SHIFT);
+	if (s->table_phys_offset == INVALID_PHYS_OFFSET) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+
+	fcreate = kzalloc(sizeof(*fcreate), GFP_KERNEL);
+	if (!fcreate) {
+		ret = -ENOMEM;
+		goto err_put_off;
+	}
+	fcreate->size = s->table_size;
+	fcreate->phys_offset = s->table_phys_offset;
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_MEMORY_FILE_CREATE,
+				      vm->partition_id, __pa(fcreate), NULL);
+	s->table_handle = fcreate->handle;
+	kfree(fcreate);
+	if (ret)
+		goto err_put_off;
+
+	s->table = memremap(vi_device->phys_start + s->table_phys_offset,
+			    s->table_size, MEMREMAP_WB);
+	if (!s->table) {
+		ret = -ENOMEM;
+		goto err_del_file;
+	}
+	memset(s->table, 0, s->table_size);
+
+	s->mm = current->mm;
+	mmgrab(s->mm);
+	ret = mmu_interval_notifier_insert(&s->mni, s->mm, s->userspace_addr,
+					   s->memory_size, &virtio_kvm_l1_mni_ops);
+	if (ret)
+		goto err_mmdrop;
+
+	mreq = kzalloc(sizeof(*mreq), GFP_KERNEL);
+	if (!mreq) {
+		ret = -ENOMEM;
+		goto err_mni;
+	}
+	mreq->slot = cpu_to_le32(s->slot);
+	mreq->flags = cpu_to_le32(s->flags);
+	mreq->guest_phys_addr = cpu_to_le64(s->guest_phys_addr);
+	mreq->memory_size = cpu_to_le64(s->memory_size);
+	mreq->table_bar_gpa = cpu_to_le64(vi_device->phys_start + s->table_phys_offset);
+	mreq->table_size = cpu_to_le64(s->table_size);
+
+	ret = virtio_kvm_send_command(vm->handle, VIRTIO_VM_SET_L1_MEMSLOT,
+				      0, __pa(mreq), NULL);
+	kfree(mreq);
+	if (ret)
+		goto err_mni;
+
+	list_add(&s->link, &vm->l1_slots);
+	mutex_unlock(&vm->l1_slot_lock);
+	return 0;
+
+err_mni:
+	mmu_interval_notifier_remove(&s->mni);
+err_mmdrop:
+	mmdrop(s->mm);
+	memunmap(s->table);
+err_del_file:
+	virtio_kvm_send_command(s->table_handle, VIRTIO_VM_MEMORY_FILE_DELETE,
+				0, 0, NULL);
+err_put_off:
+	virtio_vm_put_unused_phys_offset(s->table_phys_offset, s->table_size);
+err_free:
+	kfree(s);
+	mutex_unlock(&vm->l1_slot_lock);
+	return ret;
+}
+
 static long
 virtio_kvm_set_user_memory_region(struct virtio_kvm_vm *vm, unsigned int ioctl,
 				  unsigned long arg)
@@ -1070,11 +1398,32 @@ virtio_kvm_set_user_memory_region(struct virtio_kvm_vm *vm, unsigned int ioctl,
 
 		ret = translate_va_to_pa(reg.userspace_addr,
 					 &phys_addr, reg.memory_size);
+		if (ret == -ENOTSUPP) {
+			kfree(reg_io);
+			kfree(mem_region);
+			return virtio_kvm_set_l1_memslot(vm, &reg);
+		}
 		if (ret)
 			goto err;
 
 		reg_io->userspace_addr = phys_addr;
 	} else {
+		struct virtio_kvm_l1_slot *l1s;
+		bool is_l1 = false;
+
+		mutex_lock(&vm->l1_slot_lock);
+		list_for_each_entry(l1s, &vm->l1_slots, link) {
+			if (l1s->slot == reg.slot) {
+				is_l1 = true;
+				break;
+			}
+		}
+		mutex_unlock(&vm->l1_slot_lock);
+		if (is_l1) {
+			kfree(reg_io);
+			kfree(mem_region);
+			return virtio_kvm_set_l1_memslot(vm, &reg);
+		}
 		/*
 		 * userspace_addr should be ignored by the host, but let's
 		 * zero it out anyway.
@@ -2214,6 +2563,19 @@ virtio_kvm_vm_release(struct inode *inode, struct file *filp)
 	u64 handle = vm->handle;
 	int ret;
 
+	mutex_lock(&l1_vm_list_lock);
+	list_del(&vm->l1_vm_link);
+	mutex_unlock(&l1_vm_list_lock);
+
+	{
+		struct virtio_kvm_l1_slot *l1s, *tmp_l1s;
+
+		list_for_each_entry_safe(l1s, tmp_l1s, &vm->l1_slots, link) {
+			list_del(&l1s->link);
+			virtio_kvm_destroy_l1_slot(l1s);
+		}
+	}
+
 	/* Free all memory regions. No need to grab the lock. */
 	list_for_each_entry_safe(reg, tmp_reg, &vm->memory_regions, link) {
 		list_del(&reg->link);
@@ -2341,6 +2703,8 @@ init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp,
 	virtkvm_partition_get(part);
 	INIT_LIST_HEAD(&vm->memory_regions);
 	mutex_init(&vm->region_lock);
+	INIT_LIST_HEAD(&vm->l1_slots);
+	mutex_init(&vm->l1_slot_lock);
 	INIT_LIST_HEAD(&vm->irqfds);
 	INIT_LIST_HEAD(&vm->ioeventfds);
 	spin_lock_init(&vm->fd_lock);
@@ -2348,6 +2712,10 @@ init_vm(struct virtio_kvm_vm *vm, u64 handle, struct file *filp,
 	vm->shm = NULL;
 	vm->run_notify = NULL;
 	vm->polled = false;
+
+	mutex_lock(&l1_vm_list_lock);
+	list_add(&vm->l1_vm_link, &l1_vm_list);
+	mutex_unlock(&l1_vm_list_lock);
 }
 
 static long

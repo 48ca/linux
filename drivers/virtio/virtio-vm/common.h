@@ -23,6 +23,10 @@
 #define VIRTIO_VM_FILE_IO		(12)
 #define VIRTIO_VM_READY			(13)
 #define VIRTIO_VM_SET_RUN_NOTIFY	(14)
+#define VIRTIO_VM_SET_L1_MEMSLOT	(15)
+#define VIRTIO_VM_INVALIDATE_L1_MEMSLOT	(16)
+#define VIRTIO_VM_L1_FAULT_POLL		(17)
+#define VIRTIO_VM_L1_FAULT_ACK		(18)
 #define VIRTIO_VM_VFIO_OPEN		(64)
 #define VIRTIO_VM_VFIO_GROUP_OPEN	(65)
 #define VIRTIO_VM_VFIO_DEVICE_READ	(66)
@@ -105,6 +109,12 @@ struct virtkvm_alloc_info {
 	unsigned long range_size;
 };
 
+struct virtio_kvm_l1_fault {
+	__le64 vm_handle;
+	__le64 gpa;
+	__le64 seq;
+};
+
 struct virtkvm_info {
 	struct virtqueue *vq;
 	char name[25];
@@ -119,6 +129,11 @@ struct virtkvm_info {
 	struct work_struct poll_refill;
 	atomic_t poll_pending;
 	struct xarray ioeventfds;
+
+	struct work_struct l1_fault_work;
+	atomic_t l1_fault_poll_active;
+	bool l1_fault_pending;
+	struct virtio_kvm_l1_fault *l1_fault_buf;
 
 	DECLARE_HASHTABLE(evfd_hash, 8);
 	struct ida evfd_ida;
@@ -222,5 +237,6 @@ struct virtio_kvm_eventfd *
 virtio_kvm_get_notify_evfd(u64 partition_id,
 			   void (*notify)(struct virtio_kvm_eventfd *evfd),
 			   void *priv);
+void virtio_kvm_handle_l1_fault_by_handle(u64 vm_handle, u64 gpa);
 
 #endif /* __VIRTIO_VM_COMMON_H */
