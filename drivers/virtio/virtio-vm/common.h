@@ -109,14 +109,27 @@ struct virtkvm_alloc_info {
 	unsigned long range_size;
 };
 
-struct virtio_kvm_l1_fault {
+#define L1_FAULT_POLL_SLOTS 16
+
+struct virtkvm_info;
+
+struct virtkvm_l1_fault {
 	__le64 vm_handle;
 	__le64 gpa;
 	__le64 seq;
 };
 
+struct virtkvm_l1_fault_slot {
+	struct virtkvm_cmd cmd;
+	struct virtkvm_cmd ack_cmd;
+	struct virtkvm_l1_fault buf;
+	struct work_struct work;
+	struct virtkvm_info *vi;
+};
+
 struct virtkvm_info {
 	struct virtqueue *vq;
+	struct virtqueue *fault_vq;
 	char name[25];
 	int index;
 
@@ -125,15 +138,15 @@ struct virtkvm_info {
 
 	/* Synchronizes virtqueue */
 	spinlock_t virtkvm_lock;
+	spinlock_t fault_vq_lock;
 
 	struct work_struct poll_refill;
 	atomic_t poll_pending;
 	struct xarray ioeventfds;
 
-	struct work_struct l1_fault_work;
-	atomic_t l1_fault_poll_active;
-	bool l1_fault_pending;
-	struct virtio_kvm_l1_fault *l1_fault_buf;
+	struct workqueue_struct *l1_fault_wq;
+	struct virtkvm_l1_fault_slot *l1_fault_slots;
+	bool l1_fault_stopping;
 
 	DECLARE_HASHTABLE(evfd_hash, 8);
 	struct ida evfd_ida;
