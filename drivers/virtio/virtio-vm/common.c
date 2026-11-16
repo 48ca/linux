@@ -1142,6 +1142,11 @@ int virtkvm_partition_create(struct virtkvm_info *vi, u64 partition_id)
 	list_add_tail(&part->link, &vi->partitions);
 	mutex_unlock(&vi->partition_lock);
 
+	err = virtio_kvm_send_command(-1, VIRTIO_VM_PARTITION_CREATE,
+				      partition_id, 0, NULL);
+	if (err)
+		goto err_unlink;
+
 	err = virtkvm_partition_init_kvm(part);
 	if (err)
 		goto err_unlink;
@@ -1197,6 +1202,8 @@ int virtkvm_partition_destroy(struct virtkvm_info *vi, u64 partition_id)
 
 	virtkvm_partition_cleanup_vfio(part);
 	virtkvm_partition_cleanup_kvm(part);
+	virtio_kvm_send_command_async(-1, VIRTIO_VM_PARTITION_DESTROY,
+				      partition_id, 0, NULL);
 	pr_info("Deregistered partition device /dev/%s for partition %llu\n",
 		part->nodename, partition_id);
 	virtkvm_partition_put(part);
