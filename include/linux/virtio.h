@@ -40,6 +40,7 @@ struct virtqueue {
 	unsigned int num_free;
 	unsigned int num_max;
 	bool reset;
+	bool doorbell_only;
 	void *priv;
 };
 
