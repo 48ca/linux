@@ -261,6 +261,7 @@ __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle,
 
 	switch (mode) {
 	case COMMAND_ASYNC:
+	case COMMAND_NOWAIT:
 		return 0;
 	case COMMAND_NORMAL:
 		for (i = 0;; ++i) {
@@ -743,6 +744,175 @@ static void refill_work(struct work_struct *work)
 	WARN_ON(ret != 0);
 }
 
+struct virtkvm_l1_ring_item {
+	struct work_struct work;
+	struct virtkvm_info *vi;
+	u64 vm_handle;
+	u64 gpa;
+	u64 seq;
+	u32 slot_id;
+};
+
+static void l1_fault_ring_item_fn(struct work_struct *work)
+{
+	struct virtkvm_l1_ring_item *item =
+		container_of(work, struct virtkvm_l1_ring_item, work);
+	struct virtkvm_info *vi = item->vi;
+	struct virtio_kvm_l1_fault_ring *ring = vi->fault_ring;
+	unsigned long flags;
+	u64 t0 = ktime_get_ns();
+	u32 head;
+
+	virtio_kvm_handle_l1_fault_slot(item->vm_handle, item->slot_id,
+					item->gpa);
+	READ_ONCE(l1_fault_gup_ns);
+	__sync_fetch_and_add(&l1_fault_gup_ns, ktime_get_ns() - t0);
+	__sync_fetch_and_add(&l1_fault_reqs_handled, 1);
+
+	spin_lock_irqsave(&vi->fault_ring_lock, flags);
+	head = le32_to_cpu(READ_ONCE(ring->ack_head));
+	WRITE_ONCE(ring->acks[head & (L1_FAULT_RING_SIZE - 1)],
+		   cpu_to_le64(item->seq));
+	smp_wmb();
+	WRITE_ONCE(ring->ack_head, cpu_to_le32(head + 1));
+	spin_unlock_irqrestore(&vi->fault_ring_lock, flags);
+
+	if (vi->ring_vq)
+		virtqueue_notify(vi->ring_vq);
+
+	kfree(item);
+}
+
+static void l1_fault_ring_work_fn(struct work_struct *work)
+{
+	struct virtkvm_info *vi =
+		container_of(work, struct virtkvm_info, fault_ring_work);
+	struct virtio_kvm_l1_fault_ring *ring = vi->fault_ring;
+	u32 tail, head;
+
+	if (!ring || READ_ONCE(vi->l1_fault_stopping))
+		return;
+
+	tail = le32_to_cpu(READ_ONCE(ring->req_tail));
+	for (;;) {
+		head = le32_to_cpu(READ_ONCE(ring->req_head));
+		smp_rmb();
+		if (tail == head)
+			break;
+		while (tail != head) {
+			struct virtkvm_l1_fault *e =
+				&ring->reqs[tail & (L1_FAULT_RING_SIZE - 1)];
+			struct virtkvm_l1_ring_item *item =
+				kmalloc(sizeof(*item), GFP_KERNEL);
+			u64 vm_handle = le64_to_cpu(READ_ONCE(e->vm_handle));
+			u64 gpa = le64_to_cpu(READ_ONCE(e->gpa));
+			u64 seq = le64_to_cpu(READ_ONCE(e->seq));
+			u32 slot_id = le32_to_cpu(READ_ONCE(e->slot_id));
+
+			tail++;
+			if (item) {
+				INIT_WORK(&item->work, l1_fault_ring_item_fn);
+				item->vi = vi;
+				item->vm_handle = vm_handle;
+				item->gpa = gpa;
+				item->seq = seq;
+				item->slot_id = slot_id;
+				queue_work(vi->l1_fault_wq, &item->work);
+			} else {
+				unsigned long flags;
+				u32 ack_h;
+
+				virtio_kvm_handle_l1_fault_slot(vm_handle, slot_id, gpa);
+				spin_lock_irqsave(&vi->fault_ring_lock, flags);
+				ack_h = le32_to_cpu(READ_ONCE(ring->ack_head));
+				WRITE_ONCE(ring->acks[ack_h & (L1_FAULT_RING_SIZE - 1)],
+					   cpu_to_le64(seq));
+				smp_wmb();
+				WRITE_ONCE(ring->ack_head, cpu_to_le32(ack_h + 1));
+				spin_unlock_irqrestore(&vi->fault_ring_lock, flags);
+				if (vi->ring_vq)
+					virtqueue_notify(vi->ring_vq);
+			}
+		}
+		smp_mb();
+		WRITE_ONCE(ring->req_tail, cpu_to_le32(tail));
+	}
+}
+
+static void l1_fault_ring_vq_done(struct virtqueue *vq)
+{
+	struct virtkvm_info *vi = vq->vdev->priv;
+
+	__sync_fetch_and_add(&l1_fault_ring_wakeups, 1);
+	if (vi && !READ_ONCE(vi->l1_fault_stopping))
+		queue_work(vi->l1_fault_wq, &vi->fault_ring_work);
+}
+
+void virtio_kvm_ensure_fault_ring(u64 partition_id)
+{
+	struct virtkvm_info *vi = vi_device;
+	struct {
+		u64 size;
+		u64 phys_offset;
+		u64 handle;
+	} *fcreate;
+	int ret;
+
+	if (!vi || READ_ONCE(vi->fault_ring_ready))
+		return;
+
+	mutex_lock(&vi->fault_ring_init_lock);
+	if (vi->fault_ring_ready)
+		goto out_unlock;
+
+	vi->fault_ring_size = PAGE_ALIGN(sizeof(*vi->fault_ring));
+	vi->fault_ring_phys_offset =
+		virtio_vm_get_unused_phys_offset(vi->fault_ring_size, PAGE_SHIFT);
+	if (vi->fault_ring_phys_offset == INVALID_PHYS_OFFSET)
+		goto out_unlock;
+
+	fcreate = kzalloc(sizeof(*fcreate), GFP_KERNEL);
+	if (!fcreate)
+		goto err_put_off;
+	fcreate->size = vi->fault_ring_size;
+	fcreate->phys_offset = vi->fault_ring_phys_offset;
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_MEMORY_FILE_CREATE,
+				      partition_id, __pa(fcreate), NULL);
+	vi->fault_ring_handle = fcreate->handle;
+	kfree(fcreate);
+	if (ret)
+		goto err_put_off;
+
+	vi->fault_ring = memremap(vi->phys_start + vi->fault_ring_phys_offset,
+				  vi->fault_ring_size, MEMREMAP_WB);
+	if (!vi->fault_ring)
+		goto err_del_file;
+	memset(vi->fault_ring, 0, vi->fault_ring_size);
+
+	ret = virtio_kvm_send_command(-1, VIRTIO_VM_SET_L1_FAULT_RING,
+				      vi->phys_start + vi->fault_ring_phys_offset,
+				      0, NULL);
+	if (ret)
+		goto err_memunmap;
+
+	WRITE_ONCE(vi->fault_ring_ready, true);
+out_unlock:
+	mutex_unlock(&vi->fault_ring_init_lock);
+	return;
+
+err_memunmap:
+	memunmap(vi->fault_ring);
+	vi->fault_ring = NULL;
+err_del_file:
+	virtio_kvm_send_command(vi->fault_ring_handle, VIRTIO_VM_MEMORY_FILE_DELETE,
+				0, 0, NULL);
+	vi->fault_ring_handle = 0;
+err_put_off:
+	virtio_vm_put_unused_phys_offset(vi->fault_ring_phys_offset,
+					 vi->fault_ring_size);
+	mutex_unlock(&vi->fault_ring_init_lock);
+}
+
 static void virtio_kvm_evfd_rcu_free(struct rcu_head *rcu)
 {
 	struct virtio_kvm_eventfd *evfd = container_of(rcu, struct virtio_kvm_eventfd, rcu);
@@ -1119,12 +1289,19 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	vi->allocinfo.range_size = vi->phys_end - vi->phys_start;
 	mt_init_flags(&vi->allocinfo.mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
 
-	/* We expect a single virtqueue. */
-	vi->vq = virtio_find_single_vq(vdev, kvm_requestq_done, "requestq");
-	if (IS_ERR(vi->vq)) {
-		err = PTR_ERR(vi->vq);
+	struct virtqueue *vqs[2];
+	struct virtqueue_info vqs_info[2] = {
+		{ "requestq", kvm_requestq_done },
+		{ "ring-notify", l1_fault_ring_vq_done },
+	};
+
+	err = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
+	if (err)
 		goto err_destroy_mt;
-	}
+
+	vi->vq = vqs[0];
+	vi->ring_vq = vqs[1];
+	vi->ring_vq->doorbell_only = true;
 
 	xa_init(&vi->ioeventfds);
 	hash_init(vi->evfd_hash);
@@ -1132,6 +1309,16 @@ static int virtio_vm_init(struct virtio_device *vdev)
 	spin_lock_init(&vi->evfd_lock);
 	INIT_WORK(&vi->poll_refill, refill_work);
 	spin_lock_init(&vi->virtkvm_lock);
+	mutex_init(&vi->fault_ring_init_lock);
+	spin_lock_init(&vi->fault_ring_lock);
+	INIT_WORK(&vi->fault_ring_work, l1_fault_ring_work_fn);
+
+	vi->l1_fault_wq = alloc_workqueue("virtio-kvm-l1-fault", WQ_UNBOUND,
+					  L1_FAULT_POLL_SLOTS);
+	if (!vi->l1_fault_wq) {
+		err = -ENOMEM;
+		goto err_del_vqs;
+	}
 
 	INIT_LIST_HEAD(&vi->partitions);
 	mutex_init(&vi->partition_lock);
@@ -1168,6 +1355,8 @@ err_cleanup_kvm:
 err_destroy_wq:
 	destroy_workqueue(eventfd_cleanup_wq);
 	eventfd_cleanup_wq = NULL;
+	if (vi->l1_fault_wq)
+		destroy_workqueue(vi->l1_fault_wq);
 err_del_vqs:
 	vdev->config->del_vqs(vdev);
 	ida_destroy(&vi->evfd_ida);
@@ -1184,7 +1373,13 @@ static void remove_common(struct virtio_device *vdev)
 	struct virtkvm_info *vi = vdev->priv;
 	struct virtio_pci_device *vp;
 
+	WRITE_ONCE(vi->l1_fault_stopping, true);
 	virtio_reset_device(vdev);
+
+	if (vi->l1_fault_wq) {
+		destroy_workqueue(vi->l1_fault_wq);
+		vi->l1_fault_wq = NULL;
+	}
 
 	if (eventfd_cleanup_wq) {
 		destroy_workqueue(eventfd_cleanup_wq);
@@ -1200,6 +1395,8 @@ static void remove_common(struct virtio_device *vdev)
 
 	mtree_destroy(&vi->allocinfo.mt);
 	ida_destroy(&vi->evfd_ida);
+	if (vi->fault_ring)
+		memunmap(vi->fault_ring);
 	vi_device = NULL;
 	kfree(vi);
 }

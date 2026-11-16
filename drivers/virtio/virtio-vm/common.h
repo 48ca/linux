@@ -23,6 +23,9 @@
 #define VIRTIO_VM_FILE_IO		(12)
 #define VIRTIO_VM_READY			(13)
 #define VIRTIO_VM_SET_RUN_NOTIFY	(14)
+#define VIRTIO_VM_SET_L1_MEMSLOT	(15)
+#define VIRTIO_VM_INVALIDATE_L1_MEMSLOT	(16)
+#define VIRTIO_VM_SET_L1_FAULT_RING	(19)
 #define VIRTIO_VM_VFIO_OPEN		(64)
 #define VIRTIO_VM_VFIO_GROUP_OPEN	(65)
 #define VIRTIO_VM_VFIO_DEVICE_READ	(66)
@@ -105,8 +108,31 @@ struct virtkvm_alloc_info {
 	unsigned long range_size;
 };
 
+#define L1_FAULT_POLL_SLOTS 16
+#define L1_FAULT_RING_SIZE 256
+
+struct virtkvm_info;
+
+struct virtkvm_l1_fault {
+	__le64 vm_handle;
+	__le64 gpa;
+	__le64 seq;
+	__le32 slot_id;
+	__le32 pad;
+};
+
+struct virtio_kvm_l1_fault_ring {
+	__le32 req_head;
+	__le32 req_tail;
+	__le32 ack_head;
+	__le32 ack_tail;
+	struct virtkvm_l1_fault reqs[L1_FAULT_RING_SIZE];
+	__le64 acks[L1_FAULT_RING_SIZE];
+};
+
 struct virtkvm_info {
 	struct virtqueue *vq;
+	struct virtqueue *ring_vq;
 	char name[25];
 	int index;
 
@@ -119,6 +145,18 @@ struct virtkvm_info {
 	struct work_struct poll_refill;
 	atomic_t poll_pending;
 	struct xarray ioeventfds;
+
+	struct workqueue_struct *l1_fault_wq;
+	bool l1_fault_stopping;
+
+	struct mutex fault_ring_init_lock;
+	bool fault_ring_ready;
+	struct virtio_kvm_l1_fault_ring *fault_ring;
+	u64 fault_ring_handle;
+	u64 fault_ring_phys_offset;
+	size_t fault_ring_size;
+	spinlock_t fault_ring_lock;
+	struct work_struct fault_ring_work;
 
 	DECLARE_HASHTABLE(evfd_hash, 8);
 	struct ida evfd_ida;
@@ -171,6 +209,7 @@ enum virtio_command_mode {
 	COMMAND_NORMAL = 0,
 	COMMAND_INTERRUPTIBLE = 1,
 	COMMAND_ASYNC = 2,
+	COMMAND_NOWAIT = 3,
 };
 
 long __virtio_kvm_send_command(struct virtkvm_cmd *cmd, u64 handle,
@@ -222,5 +261,10 @@ struct virtio_kvm_eventfd *
 virtio_kvm_get_notify_evfd(u64 partition_id,
 			   void (*notify)(struct virtio_kvm_eventfd *evfd),
 			   void *priv);
+void virtio_kvm_handle_l1_fault_slot(u64 vm_handle, u32 slot_id, u64 gpa);
+void virtio_kvm_ensure_fault_ring(u64 partition_id);
+extern unsigned long l1_fault_ring_wakeups;
+extern unsigned long l1_fault_reqs_handled;
+extern unsigned long l1_fault_gup_ns;
 
 #endif /* __VIRTIO_VM_COMMON_H */
