@@ -35,6 +35,7 @@
 #include <linux/kmemleak.h>
 #include <linux/execmem.h>
 #include <linux/arm-rsi-cmds.h>
+#include <linux/vmemmap-optimization.h>
 
 
 #include <asm/boot.h>
@@ -92,10 +93,21 @@ phys_addr_t __ro_after_init arm64_dma_phys_limit;
  * in the virtual address space.
  */
 #if ARM64_MEMSTART_SHIFT < SECTION_SIZE_BITS
-#define ARM64_MEMSTART_ALIGN	(1UL << SECTION_SIZE_BITS)
+#define ARM64_MEMSTART_BASE_ALIGN	(1UL << SECTION_SIZE_BITS)
 #else
-#define ARM64_MEMSTART_ALIGN	(1UL << ARM64_MEMSTART_SHIFT)
+#define ARM64_MEMSTART_BASE_ALIGN	(1UL << ARM64_MEMSTART_SHIFT)
 #endif
+
+/*
+ * With CONFIG_VMEMMAP_OPTIMIZATION, compound_head() masks the address of a
+ * tail page to find its head, so the head struct page of every folio must be
+ * naturally aligned to the folio's vmemmap size. The vmemmap is offset by
+ * memstart_addr, so memstart_addr must be aligned to the largest folio size.
+ */
+#define ARM64_VMEMMAP_OPT_ALIGN						\
+	PFN_PHYS(MAX_FOLIO_VMEMMAP_ALIGN / sizeof(struct page))
+#define ARM64_MEMSTART_ALIGN						\
+	max_t(phys_addr_t, ARM64_MEMSTART_BASE_ALIGN, ARM64_VMEMMAP_OPT_ALIGN)
 
 static void __init arch_reserve_crashkernel(void)
 {
@@ -218,6 +230,8 @@ void __init arm64_memblock_init(void)
 	/*
 	 * Select a suitable value for the base of physical memory.
 	 */
+	BUILD_BUG_ON(MAX_FOLIO_VMEMMAP_ALIGN &&
+		     !IS_ALIGNED(VMEMMAP_START, MAX_FOLIO_VMEMMAP_ALIGN));
 	memstart_addr = round_down(memblock_start_of_DRAM(),
 				   ARM64_MEMSTART_ALIGN);
 
