@@ -1931,6 +1931,12 @@ static inline void clear_young_dirty_ptes(struct vm_area_struct *vma,
 
 #endif /* CONFIG_ARM64_CONTPTE */
 
+#define arch_support_vmemmap_remap arch_support_vmemmap_remap
+static inline bool arch_support_vmemmap_remap(void)
+{
+	return system_supports_bbm_through_af();
+}
+
 static inline int try_update_vmemmap_pte(unsigned long addr, pte_t *ptep,
 					 const pte_t pte)
 {

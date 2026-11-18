@@ -30,6 +30,7 @@
 #include <linux/mm_inline.h>
 #include <linux/pagewalk.h>
 #include <linux/stop_machine.h>
+#include <linux/vmemmap-optimization.h>
 
 #include <asm/barrier.h>
 #include <asm/cputype.h>
@@ -1842,6 +1843,14 @@ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
 	WARN_ON((start < VMEMMAP_START) || (end > VMEMMAP_END));
 	/* [start, end] should be within one section */
 	WARN_ON_ONCE(end - start > PAGES_PER_SECTION * sizeof(struct page));
+
+	/*
+	 * Whether HVO is supported is only known once the system-wide CPU
+	 * features have been finalized, which is after the vmemmap has been
+	 * populated, so the section-based vmemmap optimization (pre-HVO) is
+	 * not supported. Boot-time HugeTLB folios are optimized later instead.
+	 */
+	section_vmemmap_optimization_disable(start, end);
 
 	if (!IS_ENABLED(CONFIG_ARM64_4K_PAGES) ||
 	    (end - start < PAGES_PER_SECTION * sizeof(struct page)))
